@@ -59,6 +59,44 @@ def _native_save(source: str, destination: str, display_name: str, media_type: s
         "display_name": display_name,
     }
 
+
+def _deliver_export(
+    source_path: str,
+    dl_name: str,
+    media_type: str,
+    save_path: str,
+    save_to_drive: bool,
+    extra: dict | None = None,
+):
+    """Return JSON when exporting to a native path or Google Drive; else None for FileResponse."""
+    if save_to_drive:
+        from services.colab_drive import is_colab_runtime, save_file_to_drive
+
+        if not is_colab_runtime():
+            raise HTTPException(status_code=400, detail="save_to_drive chỉ khả dụng trên Colab runtime.")
+        try:
+            result = save_file_to_drive(source_path, dl_name, media_type)
+        except ValueError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if extra:
+            result.update(extra)
+        return result
+
+    if save_path:
+        result = _native_save(source_path, save_path, dl_name, media_type)
+        if extra:
+            result.update(extra)
+        return result
+
+    return None
+
+
+@router.get("/colab/drive-status")
+def colab_drive_status():
+    from services.colab_drive import drive_status
+
+    return drive_status()
+
 @router.get("/tasks/stream/{task_id}")
 async def stream_task(task_id: str, after_seq: int = 0):
     """Universal Server-Sent Event stream for background tasks.
@@ -279,7 +317,7 @@ def _hex_to_ass_color(value: str, alpha: str = "00") -> str:
     return f"&H{alpha}{bb.upper()}{gg.upper()}{rr.upper()}"
 
 
-def _write_burn_ass(job: dict, exports_dir: str, stamp: str, dual: bool, sub_x: float, sub_y: float,
+def _write_burn_ass(job: dict, exports_dir: str, stamp: str, dual: bool, sub_x: float, sub_y: float, sub_w: float,
                     font_size: int = 420, sub_color: str = "#ffffff", sub_bg_color: str = "#000000",
                     fitted_segments: "list[dict] | None" = None) -> str | None:
     segments = job.get("segments", [])
@@ -291,6 +329,14 @@ def _write_burn_ass(job: dict, exports_dir: str, stamp: str, dual: bool, sub_x: 
     play_h = 10000
     pos_x = int(_clamp_float(sub_x, 0.0, 1.0) * play_w)
     pos_y = int(_clamp_float(sub_y, 0.0, 1.0) * play_h)
+
+    # Compute left/right margins to wrap text to the custom box width
+    half_w = _clamp_float(sub_w, 0.05, 1.0) / 2.0
+    left_ratio = _clamp_float(sub_x - half_w, 0.0, 0.95)
+    right_ratio = _clamp_float(1.0 - (sub_x + half_w), 0.0, 0.95)
+    margin_l = int(left_ratio * play_w)
+    margin_r = int(right_ratio * play_w)
+
     ass_font_size = int(_clamp_float(font_size, 180, 900))
     primary = _hex_to_ass_color(sub_color, "00")
     back = _hex_to_ass_color(sub_bg_color, "66")
@@ -298,7 +344,7 @@ def _write_burn_ass(job: dict, exports_dir: str, stamp: str, dual: bool, sub_x: 
         "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {play_w}", f"PlayResY: {play_h}", "ScaledBorderAndShadow: yes", "",
         "[V4+ Styles]",
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        f"Style: Default,Arial,{ass_font_size},{primary},&H000000FF,&HAA000000,{back},-1,0,0,0,100,100,0,0,3,18,4,2,80,80,80,1",
+        f"Style: Default,Arial,{ass_font_size},{primary},&H000000FF,&HAA000000,{back},-1,0,0,0,100,100,0,0,3,18,4,2,{margin_l},{margin_r},80,1",
         "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
     for seg in segments:
@@ -473,10 +519,12 @@ async def dub_download(
     default_track: str = Query("original"),
     include_tracks: str = Query("", description="Comma-separated list of tracks to include (e.g. 'original,de,es'). Empty = include all."),
     save_path: str = Query("", description="Absolute destination path. If set, mux output is copied there and JSON returned instead of FileResponse."),
+    save_to_drive: bool = Query(False, description="Colab runtime: copy export to mounted Google Drive and return JSON with Drive links."),
     burn_subs: bool = Query(False, description="Burn subtitles into the video stream (forces re-encode). Uses dual-subtitle layout when dual=1."),
     dual: bool = Query(False, description="When burn_subs=1, render translated on top of italicised original."),
     sub_x: float = Query(0.5, ge=0.0, le=1.0),
     sub_y: float = Query(0.86, ge=0.0, le=1.0),
+    sub_w: float = Query(0.76, ge=0.05, le=1.0),
     sub_font_size: int = Query(420, ge=180, le=900),
     sub_color: str = Query("#ffffff"),
     sub_bg_color: str = Query("#000000"),
@@ -567,8 +615,8 @@ async def dub_download(
         safe_name = "".join(c for c in base_name if c.isalnum() or c in "-_ ").strip() or "output"
         dl_name = f"dubbed_{safe_name}_{safe_lang}_{stamp}.{fmt}"
         media_type = _MEDIA_TYPES.get(f".{fmt}", "audio/mp4")
-        if save_path:
-            return _native_save(out_path, save_path, dl_name, media_type=media_type)
+        if save_path or save_to_drive:
+            return _deliver_export(out_path, dl_name, media_type, save_path, save_to_drive)
         return FileResponse(
             out_path, media_type=media_type,
             headers={"Content-Disposition": f'attachment; filename="{dl_name}"'},
@@ -603,7 +651,7 @@ async def dub_download(
     # Smart Fit: cue times come from the fitted timeline — that's where the
     # dubbed audio actually sits, whether or not the video retime succeeds.
     fitted_segments = _fitted_segments_for(job, default_track) if default_track and default_track != "original" else None
-    sub_path = _write_burn_ass(job, exports_dir, stamp, dual, sub_x, sub_y, sub_font_size, sub_color, sub_bg_color, fitted_segments=fitted_segments) if burn_subs else None
+    sub_path = _write_burn_ass(job, exports_dir, stamp, dual, sub_x, sub_y, sub_w, sub_font_size, sub_color, sub_bg_color, fitted_segments=fitted_segments) if burn_subs else None
 
     # ── Smart Fit video retime (two-tier) ─────────────────────────────────
     # Tier 1 (≤48 chunks): single filter_complex graph inlined into the mux
@@ -889,11 +937,13 @@ async def dub_download(
     if retime_warning is not None:
         extra_headers["X-Dub-Export-Warning"] = "video-retime-fallback"
 
-    if save_path:
-        result = _native_save(output_path, save_path, dl_name, media_type="video/mp4")
+    if save_path or save_to_drive:
+        extra = None
         if retime_warning is not None:
-            result["warning"] = {"type": "video_retime_fallback", **retime_warning}
-        return result
+            extra = {"warning": {"type": "video_retime_fallback", **retime_warning}}
+        result = _deliver_export(output_path, dl_name, "video/mp4", save_path, save_to_drive, extra=extra)
+        if result is not None:
+            return result
 
     return FileResponse(
         output_path, media_type="video/mp4",
@@ -1399,7 +1449,7 @@ async def dub_qc_pass(job_id: str, lang: str = Query(None), drift_threshold: flo
 
 @router.get("/dub/download-audio/{job_id}")
 @router.get("/dub/download-audio/{job_id}/{filename}")
-async def dub_download_audio(job_id: str, lang: str = Query(None), preserve_bg: bool = Query(True), save_path: str = Query("")):
+async def dub_download_audio(job_id: str, lang: str = Query(None), preserve_bg: bool = Query(True), save_path: str = Query(""), save_to_drive: bool = Query(False)):
     job = _get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1443,8 +1493,10 @@ async def dub_download_audio(job_id: str, lang: str = Query(None), preserve_bg: 
     base_name = os.path.splitext(job.get('filename', 'audio'))[0]
     safe_name = ''.join(c for c in base_name if c.isalnum() or c in '-_ ').strip() or 'audio'
     dl_name = f"dubbed_audio_{lang_label}_{safe_name}_{stamp}.wav"
-    if save_path:
-        return _native_save(wav_path, save_path, dl_name, media_type="audio/wav")
+    if save_path or save_to_drive:
+        result = _deliver_export(wav_path, dl_name, "audio/wav", save_path, save_to_drive)
+        if result is not None:
+            return result
     return FileResponse(
         wav_path, media_type="audio/wav",
         headers={"Content-Disposition": f'attachment; filename="{dl_name}"'},
@@ -1498,6 +1550,7 @@ async def dub_export_srt(
     job_id: str,
     dual: bool = False,
     lang: str = Query(None, description="Track language code. When that track was generated under Smart Fit or stretch_video, cue times come from the fitted timeline."),
+    save_to_drive: bool = Query(False, description="Colab runtime: write SRT to mounted Google Drive and return JSON."),
 ):
     job = _get_job(job_id)
     if not job:
@@ -1528,6 +1581,17 @@ async def dub_export_srt(
     base_name = os.path.splitext(job.get('filename', 'video'))[0]
     suffix = "_dual" if dual else ""
     dl_name = f"subtitles_{base_name}{suffix}.srt"
+
+    if save_to_drive:
+        from services.colab_drive import is_colab_runtime, save_bytes_to_drive
+
+        if not is_colab_runtime():
+            raise HTTPException(status_code=400, detail="save_to_drive chỉ khả dụng trên Colab runtime.")
+        try:
+            return save_bytes_to_drive(srt_content.encode("utf-8"), dl_name, "text/plain")
+        except ValueError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
     return Response(
         content=srt_content,
         media_type="text/plain",
