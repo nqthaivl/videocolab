@@ -1,10 +1,10 @@
-﻿# Video Clone Colab Runtime
+# Video Clone Colab Runtime
 
-Repo nÃ y chá»‰ chá»©a pháº§n runtime cáº§n thiáº¿t Ä‘á»ƒ cháº¡y backend Video Clone trÃªn Google Colab.
+Repo này chỉ chứa phần runtime cần thiết để chạy backend Video Clone trên Google Colab.
 
-KhÃ´ng cáº§n Ä‘Æ°a toÃ n bá»™ code desktop, Electron, frontend, build assets hoáº·c keygen lÃªn Colab.
+Không cần đưa toàn bộ code desktop, Electron, frontend, build assets hoặc keygen lên Colab.
 
-## Files cáº§n cÃ³
+## File cần có
 
 - `backend/`
 - `omnivoice/`
@@ -13,15 +13,15 @@ KhÃ´ng cáº§n Ä‘Æ°a toÃ n bá»™ code desktop, Electron, frontend, 
 - `Video_Clone_Douyin_Colab.ipynb`
 - `LICENSE`
 
-## CÃ¡ch cáº­p nháº­t tá»« repo desktop
+## Cách cập nhật từ repo desktop
 
-Cháº¡y trong repo `Video-Clone-Douyin-main`:
+Chạy trong repo `Video-Clone-Douyin-main`:
 
 ```powershell
 .\scripts\export-colab-runtime.ps1 -Destination "C:\path\to\videocolab" -Clean
 ```
 
-Sau Ä‘Ã³ commit/push thÆ° má»¥c `videocolab` lÃªn:
+Sau đó commit/push thư mục `videocolab` lên:
 
 ```text
 https://github.com/nqthaivl/videocolab.git
