@@ -7,7 +7,7 @@ import uuid
 import asyncio
 import logging
 from typing import Optional
-from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi import APIRouter, File, HTTPException, Query, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 
 from core.config import DUB_DIR, dub_seg_path
@@ -170,6 +170,33 @@ async def dub_list_tracks(job_id: str):
     return {"tracks": job.get("dubbed_tracks", {})}
 
 
+@router.post("/dub/overlay-logo/{job_id}")
+async def dub_upload_overlay_logo(job_id: str, logo: UploadFile = File(...)):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", job_id):
+        raise HTTPException(status_code=400, detail="Invalid job id")
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    ext = os.path.splitext(logo.filename or "")[1].lower()
+    if ext not in {".png", ".jpg", ".jpeg", ".webp"}:
+        raise HTTPException(status_code=400, detail="Logo must be PNG, JPG, JPEG, or WEBP")
+    overlays_dir = os.path.join(DUB_DIR, job_id, "overlays")
+    os.makedirs(overlays_dir, exist_ok=True)
+    out_path = os.path.realpath(os.path.join(overlays_dir, f"logo{ext}"))
+    base = os.path.realpath(os.path.join(DUB_DIR, job_id))
+    if out_path != base and not out_path.startswith(base + os.sep):
+        raise HTTPException(status_code=400, detail="Invalid logo path")
+    data = await logo.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Logo file is empty")
+    if len(data) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Logo file is too large")
+    with open(out_path, "wb") as f:
+        f.write(data)
+    job["overlay_logo_path"] = out_path
+    return {"logo_path": out_path}
+
+
 def _write_burn_srt(job: dict, exports_dir: str, stamp: str, dual: bool,
                     fitted_segments: "list[dict] | None" = None) -> str | None:
     """Build a temp SRT from job segments for use with ffmpeg's subtitles filter.
@@ -206,6 +233,81 @@ def _ffmpeg_filter_escape(path: str) -> str:
     Backslashes first, then colons, then single quotes.
     """
     return path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def _clamp_float(value: float, low: float, high: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return low
+    return max(low, min(high, parsed))
+
+
+def _video_filter_label(stream_ref: str) -> str:
+    if stream_ref.startswith("["):
+        return stream_ref
+    if stream_ref.endswith(":v:0"):
+        return f"[{stream_ref[:-2]}]"
+    if stream_ref.endswith(":v"):
+        return f"[{stream_ref}]"
+    return f"[{stream_ref}:v]"
+
+
+def _ass_escape(text: str) -> str:
+    return str(text or "").replace("\\", "\\\\").replace("{", "(").replace("}", ")").replace("\r\n", "\\N").replace("\n", "\\N")
+
+
+def _format_ass_time(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s2 = int(seconds % 60)
+    cs = int(round((seconds - int(seconds)) * 100))
+    if cs >= 100:
+        s2 += 1
+        cs = 0
+    return f"{h}:{m:02d}:{s2:02d}.{cs:02d}"
+
+
+def _hex_to_ass_color(value: str, alpha: str = "00") -> str:
+    clean = str(value or "").strip().lstrip("#")
+    if len(clean) == 3:
+        clean = "".join(ch * 2 for ch in clean)
+    if not re.fullmatch(r"[0-9A-Fa-f]{6}", clean):
+        clean = "FFFFFF"
+    rr, gg, bb = clean[0:2], clean[2:4], clean[4:6]
+    return f"&H{alpha}{bb.upper()}{gg.upper()}{rr.upper()}"
+
+
+def _write_burn_ass(job: dict, exports_dir: str, stamp: str, dual: bool, sub_x: float, sub_y: float,
+                    font_size: int = 420, sub_color: str = "#ffffff", sub_bg_color: str = "#000000",
+                    fitted_segments: "list[dict] | None" = None) -> str | None:
+    segments = job.get("segments", [])
+    if not segments:
+        return None
+    if fitted_segments:
+        segments = _apply_fitted_times(segments, fitted_segments)
+    play_w = 10000
+    play_h = 10000
+    pos_x = int(_clamp_float(sub_x, 0.0, 1.0) * play_w)
+    pos_y = int(_clamp_float(sub_y, 0.0, 1.0) * play_h)
+    ass_font_size = int(_clamp_float(font_size, 180, 900))
+    primary = _hex_to_ass_color(sub_color, "00")
+    back = _hex_to_ass_color(sub_bg_color, "66")
+    lines = [
+        "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {play_w}", f"PlayResY: {play_h}", "ScaledBorderAndShadow: yes", "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Default,Arial,{ass_font_size},{primary},&H000000FF,&HAA000000,{back},-1,0,0,0,100,100,0,0,3,18,4,2,80,80,80,1",
+        "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    for seg in segments:
+        text = _ass_escape(_pick_subtitle_text(seg, dual))
+        lines.append(f"Dialogue: 0,{_format_ass_time(seg['start'])},{_format_ass_time(seg['end'])},Default,,0,0,0,,{{\\pos({pos_x},{pos_y})}}{text}")
+    sub_path = os.path.join(exports_dir, f"burn_subs_{stamp}.ass")
+    with open(sub_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return sub_path
 
 
 def _build_video_stretch_filter_graph(
@@ -373,7 +475,22 @@ async def dub_download(
     save_path: str = Query("", description="Absolute destination path. If set, mux output is copied there and JSON returned instead of FileResponse."),
     burn_subs: bool = Query(False, description="Burn subtitles into the video stream (forces re-encode). Uses dual-subtitle layout when dual=1."),
     dual: bool = Query(False, description="When burn_subs=1, render translated on top of italicised original."),
-    out_format: str = Query("m4a", description="Audio-only jobs (#119): output container — wav, m4a, mp3, or flac. Ignored for video jobs."),
+    sub_x: float = Query(0.5, ge=0.0, le=1.0),
+    sub_y: float = Query(0.86, ge=0.0, le=1.0),
+    sub_font_size: int = Query(420, ge=180, le=900),
+    sub_color: str = Query("#ffffff"),
+    sub_bg_color: str = Query("#000000"),
+    blur_subs: bool = Query(False),
+    blur_regions: str = Query(""),
+    blur_x: float = Query(0.12, ge=0.0, le=1.0),
+    blur_y: float = Query(0.78, ge=0.0, le=1.0),
+    blur_w: float = Query(0.76, ge=0.01, le=1.0),
+    blur_h: float = Query(0.14, ge=0.01, le=1.0),
+    logo_overlay: bool = Query(False),
+    logo_x: float = Query(0.78, ge=0.0, le=1.0),
+    logo_y: float = Query(0.08, ge=0.0, le=1.0),
+    logo_w: float = Query(0.16, ge=0.03, le=0.6),
+    out_format: str = Query("m4a", description="Audio-only jobs (#119): output container - wav, m4a, mp3, or flac. Ignored for video jobs."),
 ):
     # Strict allowlist on the path param BEFORE it reaches any filesystem
     # path or ffmpeg argv (export dir, retime work path, slice paths). Real
@@ -486,7 +603,7 @@ async def dub_download(
     # Smart Fit: cue times come from the fitted timeline — that's where the
     # dubbed audio actually sits, whether or not the video retime succeeds.
     fitted_segments = _fitted_segments_for(job, default_track) if default_track and default_track != "original" else None
-    sub_path = _write_burn_srt(job, exports_dir, stamp, dual, fitted_segments=fitted_segments) if burn_subs else None
+    sub_path = _write_burn_ass(job, exports_dir, stamp, dual, sub_x, sub_y, sub_font_size, sub_color, sub_bg_color, fitted_segments=fitted_segments) if burn_subs else None
 
     # ── Smart Fit video retime (two-tier) ─────────────────────────────────
     # Tier 1 (≤48 chunks): single filter_complex graph inlined into the mux
@@ -548,6 +665,13 @@ async def dub_download(
         retimed_idx = input_idx
         input_idx += 1
 
+    logo_idx = None
+    logo_path = job.get("overlay_logo_path") if logo_overlay else None
+    if logo_path and os.path.exists(logo_path):
+        cmd += ["-i", logo_path]
+        logo_idx = input_idx
+        input_idx += 1
+
     bg_audio = job.get("no_vocals_path") if preserve_bg else None
     bg_idx = None
     if bg_audio and os.path.exists(bg_audio) and filtered_tracks:
@@ -582,6 +706,34 @@ async def dub_download(
                 )
                 video_map = "[vtpad]"
                 video_reencode = True
+    if blur_subs:
+        regions = []
+        if blur_regions:
+            try:
+                raw_regions = json.loads(blur_regions)
+                if isinstance(raw_regions, list):
+                    regions = raw_regions
+            except Exception:
+                regions = []
+        if not regions:
+            regions = [{"x": blur_x, "y": blur_y, "w": blur_w, "h": blur_h}]
+        for idx, region in enumerate(regions[:12]):
+            bx = _clamp_float(region.get("x", blur_x), 0.0, 0.98)
+            by = _clamp_float(region.get("y", blur_y), 0.0, 0.98)
+            bw = min(_clamp_float(region.get("w", blur_w), 0.02, 1.0), 1.0 - bx)
+            bh = min(_clamp_float(region.get("h", blur_h), 0.02, 1.0), 1.0 - by)
+            blur_src = _video_filter_label(video_map)
+            base_label = f"vblurbase{idx}"
+            crop_label = f"vblurcrop{idx}"
+            blurred_label = f"vblurred{idx}"
+            out_label = f"vblur{idx}"
+            filter_parts.append(
+                f"{blur_src}split=2[{base_label}][{crop_label}];"
+                f"[{crop_label}]crop=iw*{bw:.6f}:ih*{bh:.6f}:iw*{bx:.6f}:ih*{by:.6f},boxblur=18:1[{blurred_label}];"
+                f"[{base_label}][{blurred_label}]overlay=main_w*{bx:.6f}:main_h*{by:.6f}[{out_label}]"
+            )
+            video_map = f"[{out_label}]"
+            video_reencode = True
     if sub_path:
         esc = _ffmpeg_filter_escape(sub_path)
         # Burn AFTER any retime so cues (already on the fitted timeline for
@@ -604,6 +756,15 @@ async def dub_download(
         if graph:
             filter_parts.append(graph)
             video_map = vlabel
+
+    if logo_idx is not None:
+        lx = _clamp_float(logo_x, 0.0, 0.98)
+        ly = _clamp_float(logo_y, 0.0, 0.98)
+        lw = _clamp_float(logo_w, 0.03, 0.6)
+        logo_src = _video_filter_label(video_map)
+        filter_parts.append(f"[{logo_idx}:v]{logo_src}scale2ref=w=main_w*{lw:.6f}:h=-1[ovlogo][vlogoref];[vlogoref][ovlogo]overlay=main_w*{lx:.6f}:main_h*{ly:.6f}[vlogo]")
+        video_map = "[vlogo]"
+        video_reencode = True
 
     cmd += ["-map", video_map]
     if include_original:
@@ -649,7 +810,7 @@ async def dub_download(
     # re-encode; stream-copy is viable when nothing touches the video
     # filter chain — including the batched Smart Fit path, whose retimed
     # intermediate is already encoded with these exact settings.
-    if sub_path or stretch_entry or video_reencode:
+    if sub_path or stretch_entry or video_reencode or blur_subs or logo_idx is not None:
         cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p"]
     else:
         cmd += ["-c:v", "copy"]
