@@ -1,0 +1,7 @@
+﻿backend/.venv/
+backend/python311/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+backend/bin/

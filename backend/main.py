@@ -1027,6 +1027,12 @@ else:
 
     @app.get("/")
     def _dev_fallback():
+        if os.environ.get("OMNIVOICE_COLAB_RUNTIME") == "1":
+            return {
+                "status": "ok",
+                "message": "Video Clone Colab backend is running. Copy this public URL into the desktop app Colab URL field.",
+                "health": "/health",
+            }
         return RedirectResponse(url="http://localhost:3901")
 
 
