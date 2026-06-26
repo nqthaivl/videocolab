@@ -37,6 +37,7 @@ dependencies = [
     "torch>=2.4",
     "torchaudio>=2.4",
     "transformers>=5.3.0",
+    "soxr",
     "accelerate",
     "pydub",
     "gradio",
