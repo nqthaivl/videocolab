@@ -465,11 +465,27 @@ async def dub_translate(req: TranslateRequest):
             return {"translated": translated, "target_lang": req.target_lang, "source_lang": src_lang,
                     **_dialect_flags(req, applied=False)}
 
-        if provider == "openai":
-            base_url = os.environ.get("TRANSLATE_BASE_URL")
-            model_name = os.environ.get("TRANSLATE_MODEL", "gpt-3.5-turbo")
+        if provider in ("openai", "llama_cpp"):
+            if provider == "llama_cpp":
+                base_url = os.environ.get("TRANSLATE_BASE_URL") or "http://127.0.0.1:8080/v1"
+                model_name = os.environ.get("TRANSLATE_MODEL") or "gpt-3.5-turbo"
+                llm_key = api_key or "local"
+            else:
+                base_url = os.environ.get("TRANSLATE_BASE_URL")
+                model_name = os.environ.get("TRANSLATE_MODEL", "gpt-3.5-turbo")
+                llm_key = api_key or "local"
+            if not base_url:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": (
+                            "No LLM endpoint configured. Set TRANSLATE_BASE_URL "
+                            "(+ TRANSLATE_API_KEY) or choose llama.cpp and start llama-server."
+                        )
+                    },
+                )
             from openai import OpenAI
-            client = OpenAI(base_url=base_url, api_key=api_key or "local")
+            client = OpenAI(base_url=base_url, api_key=llm_key)
 
             def _build_prompt(src_code: str, tgt_code: str) -> str:
                 """Build a system prompt that resists hallucinations on small

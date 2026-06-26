@@ -21,7 +21,13 @@ from pydantic import BaseModel
 from core import prefs
 from utils import hf_progress
 from utils import download_aggregator
-from .models import KNOWN_MODELS, invalidate_cache
+from .models import (
+    KNOWN_MODELS,
+    delete_gguf_from_cache,
+    get_catalog_entry,
+    invalidate_cache,
+    model_hf_repo,
+)
 
 logger = logging.getLogger("omnivoice.setup.download")
 router = APIRouter()
@@ -242,7 +248,20 @@ _WEIGHT_FLOORS = {
 }
 
 
-def _validate_snapshot_has_weights(repo_id: str, snapshot_path: str) -> None:
+def _validate_snapshot_has_gguf(snapshot_path: str, gguf_pattern: str) -> None:
+    """Raise when the expected GGUF quant is missing from a finished snapshot."""
+    from . import models as _models
+
+    found = _models._find_gguf_in_dir(snapshot_path, gguf_pattern)
+    if found:
+        return
+    raise OSError(
+        f"download finished but GGUF matching {gguf_pattern!r} was not found in "
+        f"{snapshot_path}. The download was likely interrupted — try again."
+    )
+
+
+def _validate_snapshot_has_weights(repo_id: str, snapshot_path: str, *, gguf_pattern: str | None = None) -> None:
     """Raise OSError when a finished snapshot has no plausible weight file —
     surfaces the truncated-download class (#352) at install time, where the
     retry loop and the UI's re-download path can deal with it, instead of at
@@ -251,6 +270,9 @@ def _validate_snapshot_has_weights(repo_id: str, snapshot_path: str) -> None:
     A snapshot is valid if it contains a recognized weight file meeting its
     per-extension floor (MM2-07) OR any file ≥ the global 5 MB floor (the
     original lenient catch — kept so this is never stricter than before)."""
+    if gguf_pattern:
+        _validate_snapshot_has_gguf(snapshot_path, gguf_pattern)
+        return
     if repo_id == "pyannote/speaker-diarization-3.1":
         # Diarization model chỉ chứa file config.yaml rất nhỏ, không có file trọng số lớn
         config_file = os.path.join(snapshot_path, "config.yaml")
@@ -368,7 +390,11 @@ async def install_model(req: InstallModelRequest):
                 HfHubHTTPError,
                 LocalEntryNotFoundError,
             )
-            logger.info("model install starting: %s", req.repo_id)
+            catalog_entry = get_catalog_entry(req.repo_id)
+            hf_repo_id = model_hf_repo(catalog_entry) if catalog_entry else req.repo_id
+            allow_patterns = catalog_entry.get("allow_patterns") if catalog_entry else None
+            gguf_pattern = catalog_entry.get("gguf_file") if catalog_entry else None
+            logger.info("model install starting: %s (hf=%s)", req.repo_id, hf_repo_id)
             # Apply opt-in Xet tuning knobs (high-perf / HDD) before downloading.
             apply_xet_env()
 
@@ -382,9 +408,11 @@ async def install_model(req: InstallModelRequest):
             # (Xet feeds bytes into whatever tqdm_class is supplied), bound the
             # parallel-files worker count, and honour an optional mirror endpoint.
             dl_kwargs: dict = {
-                "repo_id": req.repo_id,
+                "repo_id": hf_repo_id,
                 "max_workers": _download_max_workers(),
             }
+            if allow_patterns:
+                dl_kwargs["allow_patterns"] = allow_patterns
             _tqdm_cls = hf_progress.tracked_tqdm_class()
             if _tqdm_cls is not None:
                 dl_kwargs["tqdm_class"] = _tqdm_cls
@@ -425,7 +453,9 @@ async def install_model(req: InstallModelRequest):
             # bytes that will actually download — BEFORE any byte flows. Seeds
             # the overall aggregator so its bar/ETA are correct from the first
             # event. Degrades gracefully (totals=None) on older/gated repos.
-            _preflight_kwargs = {"repo_id": req.repo_id, "dry_run": True}
+            _preflight_kwargs = {"repo_id": hf_repo_id, "dry_run": True}
+            if allow_patterns:
+                _preflight_kwargs["allow_patterns"] = allow_patterns
             if _endpoint:
                 _preflight_kwargs["endpoint"] = _endpoint
             if _hf_token:
@@ -472,9 +502,9 @@ async def install_model(req: InstallModelRequest):
                     # Any failure falls through to snapshot_download — the
                     # accelerator can never compromise a correct install.
                     _snapshot_path = None
-                    if _attempt == 1 and _segmented_enabled() and not _xet_active():
+                    if _attempt == 1 and _segmented_enabled() and not _xet_active() and not allow_patterns:
                         try:
-                            _snapshot_path = _segmented_snapshot(req.repo_id, endpoint=_endpoint)
+                            _snapshot_path = _segmented_snapshot(hf_repo_id, endpoint=_endpoint)
                         except _InstallCancelled:
                             raise
                         except Exception as _seg_err:
@@ -485,7 +515,9 @@ async def install_model(req: InstallModelRequest):
                             _snapshot_path = None
                     if _snapshot_path is None:
                         _snapshot_path = snapshot_download(**dl_kwargs)
-                    _validate_snapshot_has_weights(req.repo_id, _snapshot_path)
+                    _validate_snapshot_has_weights(
+                        hf_repo_id, _snapshot_path, gguf_pattern=gguf_pattern,
+                    )
                     break
                 except (HfHubHTTPError, LocalEntryNotFoundError, OSError) as net_err:
                     if _attempt >= _max_attempts:
@@ -577,6 +609,10 @@ async def cancel_install(req: InstallModelRequest):
 @router.delete("/models/{repo_id:path}")
 def delete_model(repo_id: str):
     """Remove every cached revision of a repo from the HF cache."""
+    catalog_entry = get_catalog_entry(repo_id)
+    hf_repo_id = model_hf_repo(catalog_entry) if catalog_entry else repo_id
+    gguf_pattern = catalog_entry.get("gguf_file") if catalog_entry else None
+
     hf_progress.emit({
         "repo_id": repo_id,
         "filename": repo_id,
@@ -584,11 +620,33 @@ def delete_model(repo_id: str):
         "phase": "delete_start",
     })
     try:
+        if gguf_pattern:
+            from .models import gguf_installed
+
+            if not gguf_installed(hf_repo_id, gguf_pattern):
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"Model {repo_id!r} isn't installed. Nothing to delete — "
+                        "run POST /models/install first if you want a fresh download."
+                    ),
+                )
+            freed = delete_gguf_from_cache(hf_repo_id, gguf_pattern)
+            hf_progress.emit({
+                "repo_id": repo_id,
+                "filename": repo_id,
+                "downloaded": 0, "total": 0, "pct": 1.0,
+                "phase": "delete_done",
+                "freed_bytes": freed,
+            })
+            invalidate_cache()
+            return {"deleted": True, "repo_id": repo_id, "freed_bytes": freed}
+
         from huggingface_hub import scan_cache_dir
         info = scan_cache_dir()
         commits = [
             rev.commit_hash
-            for entry in info.repos if entry.repo_id == repo_id
+            for entry in info.repos if entry.repo_id == hf_repo_id
             for rev in entry.revisions
         ]
         if not commits:

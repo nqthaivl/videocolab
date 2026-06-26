@@ -51,6 +51,123 @@ KNOWN_MODELS = _load_models_from_yaml()
 # Back-compat tuple view for code that expects (repo_id, label) pairs.
 REQUIRED_MODELS = [(m["repo_id"], m["label"]) for m in KNOWN_MODELS if m.get("required")]
 
+_CATALOG_BY_ID = {m["repo_id"]: m for m in KNOWN_MODELS}
+
+
+def get_catalog_entry(repo_id: str) -> dict | None:
+    """Return a catalog entry by its internal repo_id."""
+    return _CATALOG_BY_ID.get(repo_id)
+
+
+def model_hf_repo(model: dict) -> str:
+    """HF repo used for cache/download — may differ from catalog repo_id."""
+    return model.get("hf_repo_id") or model["repo_id"]
+
+
+def _gguf_name_matches(filename: str, pattern: str) -> bool:
+    """Match a GGUF filename against a catalog gguf_file token."""
+    name = filename.lower()
+    token = pattern.lower().lstrip(".")
+    if not token:
+        return name.endswith(".gguf")
+    return token in name and name.endswith(".gguf")
+
+
+def _find_gguf_in_dir(root: str, pattern: str) -> tuple[str, int] | None:
+    """Return (path, size) for the first matching GGUF under root."""
+    floor = _WEIGHT_FLOORS[".gguf"]
+    try:
+        for dirpath, _dirs, files in os.walk(root, followlinks=True):
+            for filename in files:
+                if filename.endswith(".incomplete"):
+                    continue
+                if not _gguf_name_matches(filename, pattern):
+                    continue
+                path = os.path.join(dirpath, filename)
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    continue
+                if size >= floor:
+                    return path, size
+    except OSError:
+        return None
+    return None
+
+
+def gguf_installed(hf_repo_id: str, gguf_pattern: str) -> bool:
+    """True when a specific GGUF quant is present in the HF cache."""
+    repo_name = _repo_dir_name(hf_repo_id)
+    for root in _hub_cache_roots():
+        snapshots = os.path.join(root, repo_name, "snapshots")
+        if not os.path.isdir(snapshots):
+            continue
+        try:
+            for revision in os.listdir(snapshots):
+                revision_dir = os.path.join(snapshots, revision)
+                if os.path.isdir(revision_dir) and _find_gguf_in_dir(revision_dir, gguf_pattern):
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def gguf_size_on_disk(hf_repo_id: str, gguf_pattern: str) -> int:
+    """Best-effort size of an installed GGUF quant."""
+    repo_name = _repo_dir_name(hf_repo_id)
+    for root in _hub_cache_roots():
+        snapshots = os.path.join(root, repo_name, "snapshots")
+        if not os.path.isdir(snapshots):
+            continue
+        try:
+            for revision in os.listdir(snapshots):
+                revision_dir = os.path.join(snapshots, revision)
+                if not os.path.isdir(revision_dir):
+                    continue
+                found = _find_gguf_in_dir(revision_dir, gguf_pattern)
+                if found:
+                    return found[1]
+        except OSError:
+            continue
+    return 0
+
+
+def model_is_installed(model: dict) -> bool:
+    """Whether a catalog model is fully present on disk."""
+    hf_repo = model_hf_repo(model)
+    gguf_pattern = model.get("gguf_file")
+    if gguf_pattern:
+        return gguf_installed(hf_repo, gguf_pattern)
+    return _repo_has_complete_weights(hf_repo)
+
+
+def delete_gguf_from_cache(hf_repo_id: str, gguf_pattern: str) -> int:
+    """Remove a specific GGUF quant from the HF cache. Returns bytes freed."""
+    freed = 0
+    repo_name = _repo_dir_name(hf_repo_id)
+    for root in _hub_cache_roots():
+        snapshots = os.path.join(root, repo_name, "snapshots")
+        if not os.path.isdir(snapshots):
+            continue
+        try:
+            for revision in os.listdir(snapshots):
+                revision_dir = os.path.join(snapshots, revision)
+                if not os.path.isdir(revision_dir):
+                    continue
+                for dirpath, _dirs, files in os.walk(revision_dir, followlinks=True):
+                    for filename in list(files):
+                        if not _gguf_name_matches(filename, gguf_pattern):
+                            continue
+                        path = os.path.join(dirpath, filename)
+                        try:
+                            freed += os.path.getsize(path)
+                            os.remove(path)
+                        except OSError:
+                            pass
+        except OSError:
+            continue
+    return freed
+
 
 # ── Dependency Injection ───────────────────────────────────────────────────
 # Use `catalog: ModelCatalog = Depends(get_model_catalog)` in endpoint params
@@ -342,16 +459,26 @@ def list_models():
 
     out = []
     for m in KNOWN_MODELS:
-        cached = cached_by_repo.get(m["repo_id"])
-        out.append({
-            **m,
-            "installed": (
+        hf_repo = model_hf_repo(m)
+        cached = cached_by_repo.get(hf_repo) or cached_by_repo.get(m["repo_id"])
+        gguf_pattern = m.get("gguf_file")
+        if gguf_pattern:
+            installed = gguf_installed(hf_repo, gguf_pattern)
+            size_on_disk = gguf_size_on_disk(hf_repo, gguf_pattern)
+            nb_files = 1 if installed else 0
+        else:
+            installed = (
                 cached is not None
                 and cached["size_on_disk"] > 0
-                and _repo_has_complete_weights(m["repo_id"])
-            ),
-            "size_on_disk_bytes": cached["size_on_disk"] if cached else 0,
-            "nb_files": cached["nb_files"] if cached else 0,
+                and _repo_has_complete_weights(hf_repo)
+            )
+            size_on_disk = cached["size_on_disk"] if cached else 0
+            nb_files = cached["nb_files"] if cached else 0
+        out.append({
+            **m,
+            "installed": installed,
+            "size_on_disk_bytes": size_on_disk,
+            "nb_files": nb_files,
             "supported": _model_supported(m),
         })
     response = {

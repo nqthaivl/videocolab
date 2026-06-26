@@ -200,3 +200,71 @@ models:
     role: Translation
     size_gb: 5.2
     note: "NLLB-200 1.3B — chất lượng dịch tốt hơn đáng kể so với bản 600M, đặc biệt với cặp Trung-Việt và các ngôn ngữ châu Á. Cần ~5.2GB dung lượng. Tải về lần đầu khi chọn engine 'NLLB-200 1.3B' trong tab Dub."
+
+  # ── llama.cpp translation (GGUF) ───────────────────────────────────────
+
+  - repo_id: "llama-cpp/translategemma-4b-q4km"
+    hf_repo_id: "SandLogicTechnologies/translategemma-4b-it-GGUF"
+    allow_patterns: ["*Q4_K_M*", "*q4_k_m*"]
+    gguf_file: "Q4_K_M"
+    llama_model: "SandLogicTechnologies/translategemma-4b-it-GGUF:Q4_K_M"
+    label: "TranslateGemma 4B (Q4_K_M) (2.5 GB)"
+    role: Translation
+    engine: llama_cpp
+    size_gb: 2.5
+    note: "Chạy qua llama-server (OpenAI-compatible). Chọn engine llama.cpp trong Công cụ dịch."
+
+  - repo_id: "llama-cpp/translategemma-4b-q5km"
+    hf_repo_id: "SandLogicTechnologies/translategemma-4b-it-GGUF"
+    allow_patterns: ["*Q5_K_M*", "*q5_k_m*"]
+    gguf_file: "Q5_K_M"
+    llama_model: "SandLogicTechnologies/translategemma-4b-it-GGUF:Q5_K_M"
+    label: "TranslateGemma 4B (Q5_K_M) (2.8 GB)"
+    role: Translation
+    engine: llama_cpp
+    size_gb: 2.8
+    note: "Chạy qua llama-server (OpenAI-compatible). Chọn engine llama.cpp trong Công cụ dịch."
+
+  - repo_id: "llama-cpp/translategemma-4b-q8"
+    hf_repo_id: "SandLogicTechnologies/translategemma-4b-it-GGUF"
+    allow_patterns: ["*Q8_0*", "*q8_0*"]
+    gguf_file: "Q8_0"
+    llama_model: "SandLogicTechnologies/translategemma-4b-it-GGUF:Q8_0"
+    label: "TranslateGemma 4B (Q8_0) (4.1 GB)"
+    role: Translation
+    engine: llama_cpp
+    size_gb: 4.1
+    note: "Chạy qua llama-server (OpenAI-compatible). Chọn engine llama.cpp trong Công cụ dịch."
+
+  - repo_id: "llama-cpp/translategemma-12b-q4km"
+    hf_repo_id: "NikolayKozloff/translategemma-12b-it-Q4_K_M-GGUF"
+    allow_patterns: ["*.gguf"]
+    gguf_file: ".gguf"
+    llama_model: "NikolayKozloff/translategemma-12b-it-Q4_K_M-GGUF:Q4_K_M"
+    label: "TranslateGemma 12B (Q4_K_M) (7.3 GB)"
+    role: Translation
+    engine: llama_cpp
+    size_gb: 7.3
+    note: "Chạy qua llama-server (OpenAI-compatible). Chọn engine llama.cpp trong Công cụ dịch."
+
+  - repo_id: "llama-cpp/qwen3-4b-instruct-q4km"
+    hf_repo_id: "bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF"
+    allow_patterns: ["*Q4_K_M*"]
+    gguf_file: "Q4_K_M"
+    llama_model: "bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF:Q4_K_M"
+    label: "Qwen 3 4B Instruct (Q4_K_M) (2.5 GB)"
+    role: Translation
+    engine: llama_cpp
+    size_gb: 2.5
+    note: "Chạy qua llama-server (OpenAI-compatible). Chọn engine llama.cpp trong Công cụ dịch."
+
+  - repo_id: "llama-cpp/qwen3-8b-q4km"
+    hf_repo_id: "bartowski/Qwen_Qwen3-8B-GGUF"
+    allow_patterns: ["*Q4_K_M*"]
+    gguf_file: "Q4_K_M"
+    llama_model: "bartowski/Qwen_Qwen3-8B-GGUF:Q4_K_M"
+    label: "Qwen 3 8B (Q4_K_M) (4.7 GB)"
+    role: Translation
+    engine: llama_cpp
+    size_gb: 4.7
+    note: "Chạy qua llama-server (OpenAI-compatible). Chọn engine llama.cpp trong Công cụ dịch."

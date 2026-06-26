@@ -117,6 +117,18 @@ REGISTRY: dict[str, dict] = {
             "Set TRANSLATE_BASE_URL + TRANSLATE_API_KEY + TRANSLATE_MODEL."
         ),
     },
+    "llama_cpp": {
+        "id": "llama_cpp",
+        "display_name": "llama.cpp (local LLM)",
+        "pip_package": "openai",
+        "probe_module": "openai",
+        "category": "llm",
+        "needs_key": False,
+        "notes": (
+            "Local llama-server with OpenAI-compatible API (default http://127.0.0.1:8080/v1). "
+            "Download a GGUF translation model in Settings → Models, then select it below."
+        ),
+    },
 }
 
 
