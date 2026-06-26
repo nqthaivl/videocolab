@@ -1,0 +1,202 @@
+# ── OmniVoice Studio — Model Catalog ─────────────────────────────────────
+#
+# This file is the source of truth for all known HuggingFace models.
+# The backend loads it at startup via `load_model_catalog()`.
+#
+# To add a model: append an entry with the fields below.
+# To remove: delete the entry. The UI will stop showing it immediately.
+#
+# Fields:
+#   repo_id    (required) — HuggingFace repository ID
+#   label      (required) — Human-readable display name
+#   role       (required) — TTS | ASR | Diarisation
+#   size_gb    (required) — Approximate download size in GiB
+#   required   (optional) — true if the app needs this model to function
+#   platforms  (optional) — restrict to specific OS+arch tags (e.g. darwin-arm64, cuda)
+#   note       (optional) — shown in the UI as a tooltip/footnote
+# ─────────────────────────────────────────────────────────────────────────
+
+models:
+  # ── Required ──────────────────────────────────────────────────────────
+
+  - repo_id: "k2-fsa/OmniVoice"
+    label: "Mô hình tạo giọng nói đa ngôn ngữ nâng cao (Zero-shot)"
+    role: TTS
+    size_gb: 2.4
+    required: true
+
+  - repo_id: "Systran/faster-whisper-large-v3"
+    label: "Mô hình nhận dạng giọng nói tự động độ chính xác cao"
+    role: ASR
+    size_gb: 2.9
+    required: true
+
+  # ── Optional ASR ──────────────────────────────────────────────────────
+
+  - repo_id: "mlx-community/whisper-large-v3-mlx"
+    label: "Mô hình nhận dạng tối ưu hóa (macOS ARM)"
+    role: ASR
+    size_gb: 3.0
+    platforms: [darwin-arm64]
+
+  - repo_id: "mlx-community/whisper-large-v3-turbo"
+    label: "Mô hình nhận dạng siêu tốc (macOS ARM)"
+    role: ASR
+    size_gb: 1.6
+    platforms: [darwin-arm64]
+    note: "Nhanh hơn gấp 5 lần so với phiên bản tiêu chuẩn. Tối ưu tốt nhất cho live dictation trên Apple Silicon."
+
+  - repo_id: "openai/whisper-large-v3"
+    label: "Mô hình nhận dạng dự phòng (CUDA)"
+    role: ASR
+    size_gb: 3.1
+    platforms: [cuda]
+
+  - repo_id: "mlx-community/whisper-tiny-mlx"
+    label: "Mô hình nhận dạng rút gọn (macOS ARM)"
+    role: ASR
+    size_gb: 0.08
+    platforms: [darwin-arm64]
+
+  - repo_id: "deepdml/faster-whisper-large-v3-turbo-ct2"
+    label: "Mô hình nhận dạng siêu tốc (Tối ưu hóa)"
+    role: ASR
+    size_gb: 1.6
+    note: "Sự cân bằng tốt nhất giữa tốc độ và chất lượng. Nhanh hơn gấp 5 lần so với bản tiêu chuẩn."
+
+  - repo_id: "Systran/faster-distil-whisper-large-v3"
+    label: "Mô hình nhận dạng rút gọn (Nhanh)"
+    role: ASR
+    size_gb: 1.5
+    note: "Mô hình chắt lọc tri thức. Đảm bảo độ chính xác cao ở tốc độ nhanh hơn."
+
+  - repo_id: "Systran/faster-whisper-medium"
+    label: "Mô hình nhận dạng trung bình (Cân bằng VRAM)"
+    role: ASR
+    size_gb: 1.5
+    note: "Sự cân bằng tốt giữa tốc độ và độ chính xác. Tiêu thụ một nửa VRAM so với bản lớn."
+
+  - repo_id: "Systran/faster-whisper-small"
+    label: "Mô hình nhận dạng nhỏ (Xem trước nhanh)"
+    role: ASR
+    size_gb: 0.5
+    note: "Phù hợp để xem trước và kiểm tra nhanh. Nhanh gấp 2 lần bản trung bình."
+
+  - repo_id: "Systran/faster-whisper-base"
+    label: "Mô hình nhận dạng tối giản (Siêu nhanh)"
+    role: ASR
+    size_gb: 0.15
+    note: "Tốc độ xử lý gần như tức thì, phù hợp cho việc lặp lại quy trình nhanh chóng."
+
+  # ── Non-Whisper ASR (from Open ASR Leaderboard) ────────────────────────
+
+  - repo_id: "nvidia/parakeet-tdt-0.6b-v3"
+    label: "Mô hình nhận dạng nâng cao (Hỗ trợ đa ngôn ngữ)"
+    role: ASR
+    size_gb: 1.2
+    platforms: [cuda]
+    note: "Vượt trội về độ chính xác trên các bài đo kiểm tiếng Anh."
+
+  - repo_id: "nvidia/parakeet-tdt-0.6b-v2"
+    label: "Mô hình nhận dạng tiếng Anh chuyên dụng (Tự động thêm dấu câu)"
+    role: ASR
+    size_gb: 1.2
+    platforms: [cuda]
+    note: "Tối ưu cho tiếng Anh với khả năng tự động thêm dấu câu và viết hoa."
+
+  - repo_id: "UsefulSensors/moonshine-base"
+    label: "Mô hình nhận dạng biên tối ưu hóa (Trung bình)"
+    role: ASR
+    size_gb: 0.12
+    note: "Độ trễ thấp, xử lý độ dài linh hoạt. Phù hợp cho thiết bị CPU hoặc thiết bị biên."
+
+  - repo_id: "UsefulSensors/moonshine-tiny"
+    label: "Mô hình nhận dạng biên tối ưu hóa (Nhỏ)"
+    role: ASR
+    size_gb: 0.05
+    note: "Độ trễ cực thấp, tốc độ nhanh nhất nhưng độ chính xác thấp hơn bản trung bình."
+
+  # ── Diarisation ───────────────────────────────────────────────────────
+
+  - repo_id: "pyannote/speaker-diarization-3.1"
+    label: "Mô hình phân tách người nói (Video nhiều nhân vật)"
+    role: Diarisation
+    size_gb: 0.8
+    note: "Yêu cầu mã khóa cấu hình truy cập bản quyền."
+
+  # ── Optional TTS ──────────────────────────────────────────────────────
+
+  - repo_id: "OpenMOSS-Team/MOSS-TTS-Nano-100M"
+    label: "Mô hình tạo giọng nói siêu nhẹ (Hỗ trợ 20 ngôn ngữ)"
+    role: TTS
+    size_gb: 0.4
+
+  - repo_id: "KittenML/kitten-tts-mini-0.8"
+    label: "Mô hình tạo giọng nói tiếng Anh tốc độ cao (CPU)"
+    role: TTS
+    size_gb: 0.08
+
+  # ── mlx-audio engines (Apple Silicon only) ────────────────────────────
+
+  - repo_id: "mlx-community/Kokoro-82M-bf16"
+    label: "Mô hình tạo giọng nói đa ngôn ngữ (Nhẹ)"
+    role: TTS
+    size_gb: 0.15
+    note: "Chỉ dành cho Apple Silicon — chạy qua nền tảng tối ưu hóa phần cứng."
+    platforms: [darwin-arm64]
+
+  - repo_id: "mlx-community/csm-1b-8bit"
+    label: "Mô hình nhân bản giọng nói (macOS ARM)"
+    role: TTS
+    size_gb: 1.1
+    note: "Chỉ dành cho Apple Silicon — chạy qua nền tảng tối ưu hóa phần cứng."
+    platforms: [darwin-arm64]
+
+  - repo_id: "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-4bit"
+    label: "Mô hình thiết kế giọng nói nâng cao (macOS ARM)"
+    role: TTS
+    size_gb: 1.4
+    note: "Chỉ dành cho Apple Silicon — chạy qua nền tảng tối ưu hóa phần cứng."
+    platforms: [darwin-arm64]
+
+  - repo_id: "mlx-community/Dia-1.6B"
+    label: "Mô hình tạo giọng biểu cảm tự nhiên (macOS ARM)"
+    role: TTS
+    size_gb: 3.2
+    note: "Chỉ dành cho Apple Silicon — chạy qua nền tảng tối ưu hóa phần cứng."
+    platforms: [darwin-arm64]
+
+  - repo_id: "mlx-community/Llama-OuteTTS-1.0-1B-4bit"
+    label: "Mô hình nhân bản giọng nói tối ưu (macOS ARM)"
+    role: TTS
+    size_gb: 0.8
+    note: "Chỉ dành cho Apple Silicon — chạy qua nền tảng tối ưu hóa phần cứng."
+    platforms: [darwin-arm64]
+
+  - repo_id: "mlx-community/Chatterbox-TTS-4bit"
+    label: "Mô hình tạo giọng nói đàm thoại (macOS ARM)"
+    role: TTS
+    size_gb: 0.5
+    note: "Chỉ dành cho Apple Silicon — chạy qua nền tảng tối ưu hóa phần cứng."
+    platforms: [darwin-arm64]
+
+  - repo_id: "mlx-community/MeloTTS-English-v3-MLX"
+    label: "Mô hình tạo giọng nói tiếng Anh tự nhiên (macOS ARM)"
+    role: TTS
+    size_gb: 0.2
+    note: "Chỉ dành cho Apple Silicon — chạy qua nền tảng tối ưu hóa phần cứng."
+    platforms: [darwin-arm64]
+
+  # ── Translation Models ────────────────────────────────────────────────
+
+  - repo_id: "Helsinki-NLP/opus-mt-zh-vi"
+    label: "Mô hình dịch Trung→Việt chuyên biệt (Nhẹ & Nhanh)"
+    role: Translation
+    size_gb: 0.3
+    note: "MarianMT được huấn luyện chuyên cho cặp ngôn ngữ Trung-Việt. Nhẹ hơn NLLB (~300MB), dịch Zh→Vi chính xác hơn NLLB-600M. Tải về lần đầu khi chọn engine 'MarianMT Zh→Vi' trong tab Dub."
+
+  - repo_id: "facebook/nllb-200-distilled-1.3B"
+    label: "Mô hình dịch đa ngôn ngữ chất lượng cao (200 ngôn ngữ)"
+    role: Translation
+    size_gb: 5.2
+    note: "NLLB-200 1.3B — chất lượng dịch tốt hơn đáng kể so với bản 600M, đặc biệt với cặp Trung-Việt và các ngôn ngữ châu Á. Cần ~5.2GB dung lượng. Tải về lần đầu khi chọn engine 'NLLB-200 1.3B' trong tab Dub."

@@ -1,0 +1,1409 @@
+"""
+ASR adapter interface — Phase 3.3 (ROADMAP.md).
+
+One protocol, multiple engines. Today we ship:
+
+    • FasterWhisperBackend — CTranslate2-based (the engine WhisperX uses).
+                            Default on Linux, Windows, mac-Intel. Also fast
+                            on mac-ARM so we use it as the cross-platform
+                            baseline and only prefer MLX on mac-ARM when
+                            explicitly installed.
+    • MLXWhisperBackend   — mlx-whisper on Apple Silicon. Optional speedup,
+                            only available when mlx wheels install (mac-ARM).
+    • PyTorchWhisperBackend — last-resort fallback using the existing
+                            `_asr_pipe` on the TTS model.
+
+Both return the raw Whisper output dict so `services.segmentation.
+segment_transcript(...)` can keep working unchanged — new backends normalise
+their output to the `{"chunks": [{"text", "timestamp": (start, end)}]}`
+shape the segmenter expects.
+
+Selection via `OMNIVOICE_ASR_BACKEND` (default: auto-detect, prefers
+faster-whisper because it's available on every platform we ship to).
+"""
+from __future__ import annotations
+
+import logging
+import os
+import re
+from abc import ABC, abstractmethod
+
+logger = logging.getLogger("omnivoice.asr")
+
+
+def _compute_type_candidates(device: str) -> list[str]:
+    """Per-device compute_type fallback chain. int8 is supported by every
+    CTranslate2 CUDA+CPU build; float16/int8_float16 only on GPUs with efficient
+    fp16 — so degrade rather than crash (#551). Honors an ASR_COMPUTE_TYPE env
+    override (power users on exotic hardware can pin int8/float32)."""
+    import os
+    override = os.environ.get("ASR_COMPUTE_TYPE")
+    if override:
+        return [override]
+    return ["float16", "int8_float16", "int8"] if device == "cuda" else ["int8", "float32"]
+
+
+def _is_compute_type_error(msg: str) -> bool:
+    low = msg.lower()
+    return "compute type" in low or "efficient float16" in low
+
+
+def _decode_audio_16k_mono(audio_path: str):
+    """Decode `audio_path` to a 16 kHz mono float32 waveform using OmniVoice's
+    *validated* ffmpeg, instead of whisperx.load_audio's bare ``"ffmpeg"`` PATH
+    lookup.
+
+    whisperx (and openai-whisper) shell out to a literal ``"ffmpeg"`` resolved
+    against the OS PATH. On Windows that resolves to whatever the system finds
+    first — a WindowsApps alias stub or a corrupt/wrong-arch download — which
+    passes `which` but explodes at spawn with ``[WinError 193] %1 is not a valid
+    Win32 application``. whisperx only catches `CalledProcessError`, so the
+    spawn-time `OSError` escapes and the dub/batch path reports the opaque
+    "Transcription produced no segments" (#479). ``find_ffmpeg()`` probes each
+    candidate with ``-version`` and returns a runnable binary (the bundled
+    imageio-ffmpeg / Tauri sidecar) — or None, so we can raise an actionable
+    error. This also fixes the imageio case a PATH-prepend can't: its binary is
+    named ``ffmpeg-<plat>-vN.exe``, not ``ffmpeg``, so bare lookup never finds
+    it. Mirrors whisperx.audio.load_audio's command exactly (16 kHz, mono, s16le).
+    """
+    import subprocess
+
+    import numpy as np
+
+    from services.ffmpeg_utils import find_ffmpeg
+
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError(
+            "Cannot transcribe: ffmpeg is missing or not runnable. Install "
+            "ffmpeg (or let OmniVoice's bundled binary download), then retry. "
+            "On Windows a '[WinError 193]' here means the ffmpeg binary is "
+            "corrupt or the wrong architecture — reinstall it or clear the "
+            "imageio-ffmpeg cache."
+        )
+    cmd = [
+        ffmpeg, "-nostdin", "-threads", "0", "-i", audio_path,
+        "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", "16000", "-",
+    ]
+    try:
+        out = subprocess.run(cmd, capture_output=True, check=True).stdout
+    except OSError as e:
+        # Belt-and-suspenders: find_ffmpeg() already -version-validated this
+        # binary, so a WinError 193 here is unexpected — surface it clearly
+        # rather than letting it become "no segments".
+        raise RuntimeError(
+            f"ffmpeg at {ffmpeg!r} could not be executed ({e}). Reinstall "
+            "ffmpeg or clear the imageio-ffmpeg cache."
+        ) from e
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or b"").decode(errors="replace")[:500]
+        raise RuntimeError(f"Failed to decode audio for transcription: {stderr}") from e
+    return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
+
+
+# ── Protocol ────────────────────────────────────────────────────────────────
+
+
+class ASRBackend(ABC):
+    id: str = "base"
+    display_name: str = "Base ASR"
+    # Accelerator families this backend can use, in preference order; always
+    # includes a fallback. Subset of {cuda, rocm, mps, xpu, cpu}. Mirrors the
+    # TTSBackend.gpu_compat contract so engine_routing.resolve_routing() can
+    # surface the effective device per host (no silent CPU fallback). The
+    # conservative default is CPU-only; subclasses declare what they really run
+    # on. (ROCm is intentionally NOT claimed yet for any ASR engine — see the
+    # per-engine notes; an unverified `rocm` claim would route ROCm hosts to a
+    # broken GPU path, strictly worse than the honest `cpu_fallback`.)
+    gpu_compat: tuple[str, ...] = ("cpu",)
+
+    @classmethod
+    @abstractmethod
+    def is_available(cls) -> tuple[bool, str]:
+        ...
+
+    @abstractmethod
+    def transcribe(self, audio_path: str, *, word_timestamps: bool = True, language: str | None = None) -> dict:
+        """Return the raw Whisper output dict. Callers (`segment_transcript`)
+        know how to read it — this stays deliberately untyped so new engines
+        that already speak the shape plug in with zero adapter work.
+        """
+
+    def unload(self) -> None:
+        """Release the model from memory."""
+        pass
+
+
+# ── WhisperX (cross-platform default — forced-alignment word timing) ────────
+
+
+class WhisperXBackend(ASRBackend):
+    id = "whisperx"
+    display_name = "WhisperX (faster-whisper + wav2vec2 forced alignment)"
+    # CTranslate2 backend: CUDA fp16 or CPU int8 (see _pick_device). ROCm not
+    # claimed — CTranslate2 has no upstream HIP build, so a ROCm host honestly
+    # gets cpu_fallback rather than a false GPU promise.
+    gpu_compat = ("cuda", "cpu")
+
+    def __init__(self):
+        self._model_name = os.environ.get("ASR_MODEL_WHISPERX", "large-v3")
+        self._asr = None
+        self._align_cache = {}  # language_code → (align_model, metadata)
+        self._device, self._compute_type = self._pick_device()
+
+    @staticmethod
+    def _pick_device() -> tuple[str, str]:
+        # CUDA fp16 when available; otherwise CPU int8 (fastest CPU path,
+        # negligible WER regression vs fp32 for whisper-large-v3).
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return "cuda", "float16"
+        except Exception:
+            pass
+        return "cpu", "int8"
+
+    @classmethod
+    def is_available(cls) -> tuple[bool, str]:
+        try:
+            import whisperx  # noqa: F401
+            return True, "ready"
+        except ImportError as e:
+            return False, f"whisperx not installed: {e}"
+
+    def _ensure_asr(self):
+        if self._asr is not None:
+            return
+        import whisperx
+        logger.info(
+            "whisperx loading ASR %s on %s (%s)",
+            self._model_name, self._device, self._compute_type,
+        )
+        # PyTorch 2.6 flipped `torch.load(weights_only=True)` to default,
+        # which breaks pyannote 3.x's VAD checkpoint (that whisperx ships):
+        # each load surfaces a different missing global — `omegaconf.*`,
+        # `typing.Any`, etc. The fix is to allowlist the pickle globals the
+        # VAD file contains via `torch.serialization.add_safe_globals` so
+        # the secure `weights_only=True` load path succeeds *without* us
+        # disabling it.
+        #
+        # An earlier defensive layer (monkey-patching `torch.load` to force
+        # `weights_only=False` for the duration of `whisperx.load_model`)
+        # was removed in P0 Wave 1: it defeated PyTorch's secure unpickler
+        # globally for any code that ran during that window, which is the
+        # opposite of what the surrounding comment claimed. If a downstream
+        # callee deserialised an attacker-controlled pickle in that window
+        # it would have executed arbitrary code with no warning. The
+        # allowlist below is the only correct mitigation; if pyannote ever
+        # ships a checkpoint with a new pickle class, the load fails loudly
+        # and we extend `_allow_vad_pickle_globals()`.
+        self._allow_vad_pickle_globals()
+        try:
+            self._asr = whisperx.load_model(
+                self._model_name,
+                device=self._device,
+                compute_type=self._compute_type,
+                # vad_method="silero" is the default; keep it so short gaps
+                # get cleaned up before transcription.
+            )
+        except (ValueError, RuntimeError) as e:
+            # #551: GPUs without efficient fp16 (older Maxwell/Pascal, GTX 16xx)
+            # or a CTranslate2/cuDNN binary mismatch raise a *ValueError*
+            # ("Requested float16 compute type, but the target device or backend
+            # do not support efficient float16 computation") at load — not an
+            # OOM, not a RuntimeError. Retry on the SAME device with the next
+            # compute_type candidate (cuda: int8_float16 → int8) before touching
+            # the OOM→CPU path, so we degrade rather than crash every chunk.
+            if _is_compute_type_error(str(e)):
+                candidates = _compute_type_candidates(self._device)
+                try:
+                    nxt = candidates[candidates.index(self._compute_type) + 1:]
+                except ValueError:
+                    nxt = [c for c in candidates if c != self._compute_type]
+                for ct in nxt:
+                    logger.warning(
+                        "whisperx %s unsupported on %s — retrying with %s. Detail: %s",
+                        self._compute_type, self._device, ct, e,
+                    )
+                    self._compute_type = ct
+                    try:
+                        self._asr = whisperx.load_model(
+                            self._model_name,
+                            device=self._device,
+                            compute_type=self._compute_type,
+                        )
+                        return
+                    except (ValueError, RuntimeError) as e2:
+                        if _is_compute_type_error(str(e2)):
+                            e = e2
+                            continue
+                        raise
+                # Exhausted compute-type candidates on this device — re-raise.
+                raise
+            # CUDA OOM: a resident TTS model + the GPU worker pool can starve
+            # VRAM on small (e.g. 8 GB laptop) GPUs, so loading large-v3 on
+            # CUDA dies here — which previously surfaced as a bare 500 from
+            # /dub/transcribe with no guidance. Fall back to CPU (slower, but
+            # dubbing still works and keeps the same model/accuracy) instead.
+            # Only triggers on a CUDA OOM, so the MPS/CPU paths are untouched.
+            if self._device == "cuda" and "out of memory" in str(e).lower():
+                logger.warning(
+                    "whisperx CUDA OOM loading %s — retrying on CPU (slower). "
+                    "Free VRAM (Flush the TTS model) for GPU-speed ASR. Detail: %s",
+                    self._model_name, e,
+                )
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except Exception:  # noqa: BLE001 — cache clear is best-effort
+                    pass
+                self._device, self._compute_type = "cpu", "int8"
+                self._asr = whisperx.load_model(
+                    self._model_name,
+                    device=self._device,
+                    compute_type=self._compute_type,
+                )
+            else:
+                raise
+
+    @staticmethod
+    def _allow_vad_pickle_globals():
+        """Register the pickle classes that pyannote's VAD checkpoint contains.
+
+        Without this, PyTorch 2.6's secure unpickler refuses to load the file
+        even if the call explicitly passes `weights_only=False` later — the
+        allowlist is per-process and harmless to re-apply. Each class we add
+        is one that has surfaced in the wild from pyannote/omegaconf/pytorch-
+        lightning pickles; extending the list is safe.
+        """
+        try:
+            import torch.serialization as _ts
+        except Exception:
+            return
+        add = getattr(_ts, "add_safe_globals", None)
+        if add is None:
+            return  # older torch — secure unpickler didn't exist
+
+        allow = []
+        # omegaconf config containers + every node wrapper type the library
+        # exposes. pyannote's VAD checkpoint pickles `ListConfig` /
+        # `DictConfig` trees whose leaves are `AnyNode`/`ValueNode`/etc., so
+        # allowlist the whole family in one pass rather than waiting for
+        # users to hit each one in turn. All of these are pure metadata
+        # containers — no executable side effects.
+        try:
+            import omegaconf.nodes as _ocn
+            import omegaconf.base as _ocb
+            from omegaconf.listconfig import ListConfig
+            from omegaconf.dictconfig import DictConfig
+            allow += [ListConfig, DictConfig]
+            for _modname in ("nodes", "base"):
+                _mod = _ocn if _modname == "nodes" else _ocb
+                for _name in dir(_mod):
+                    _obj = getattr(_mod, _name, None)
+                    if isinstance(_obj, type) and _obj.__module__ == f"omegaconf.{_modname}":
+                        allow.append(_obj)
+        except Exception:
+            pass
+        # `EnumNode` references real enum classes at unpickle time; allow
+        # the base Enum/IntEnum/Flag types so configs using enums load.
+        try:
+            import enum
+            allow += [enum.Enum, enum.IntEnum, enum.Flag, enum.IntFlag]
+        except Exception:
+            pass
+        # torch utility types that aren't in the secure unpickler's
+        # default allowlist. `TorchVersion` is a `str` subclass that
+        # pyannote/lightning serialise as metadata; `Size` is the shape
+        # tuple type used in tensor metadata. Both are inert data.
+        try:
+            from torch.torch_version import TorchVersion
+            import torch as _torch
+            allow += [TorchVersion, _torch.Size]
+        except Exception:
+            pass
+        # PyTorch Lightning serialises `hyper_parameters` as
+        # `argparse.Namespace` (or an AttributeDict subclass thereof) so
+        # configs roundtrip. Allowlist the Namespace constructor — it is
+        # just an attribute bag with no executable side effects.
+        try:
+            import argparse
+            allow += [argparse.Namespace]
+        except Exception:
+            pass
+        # pyannote-specific metadata classes that travel with the VAD
+        # checkpoint. Only the inert data-only types are allowlisted —
+        # the `Model` / `Task` / `Dataset` classes from the same modules
+        # do real work in `__init__` and stay off the allowlist.
+        try:
+            from pyannote.audio.core.model import Introspection, Output
+            from pyannote.audio.core.task import Problem, Resolution, Specifications
+            allow += [Introspection, Output, Problem, Resolution, Specifications]
+        except Exception:
+            pass
+        # Python typing primitives that show up in config annotations.
+        try:
+            import typing
+            allow += [typing.Any]
+        except Exception:
+            pass
+        # pytorch-lightning's OrderedDict-backed state dict helpers.
+        try:
+            from collections import OrderedDict, defaultdict
+            allow += [OrderedDict, defaultdict]
+        except Exception:
+            pass
+        # Plain-data builtins. pyannote's VAD checkpoint pickles config
+        # entries that resolve to bare builtin constructors (`GLOBAL list`,
+        # `GLOBAL int`, …) and the secure unpickler refuses each one
+        # without an explicit allowlist. These constructors only build
+        # inert data primitives — no side effects, no code paths — so the
+        # full set is safe to allowlist together, which avoids users
+        # hitting them one-at-a-time as the checkpoint deserialises.
+        allow += [
+            list, dict, tuple, set, frozenset,
+            int, float, bool, str, bytes, bytearray, complex,
+            type(None), slice, range,
+        ]
+        # numpy scalar/array constructors that show up in pyannote configs
+        # (sample rates, hop sizes saved as numpy ints/floats). Each is a
+        # pure data type — safe to allowlist.
+        try:
+            import numpy as _np
+            allow += [
+                _np.ndarray, _np.dtype,
+                _np.int8, _np.int16, _np.int32, _np.int64,
+                _np.uint8, _np.uint16, _np.uint32, _np.uint64,
+                _np.float16, _np.float32, _np.float64,
+                _np.bool_, _np.complex64, _np.complex128,
+            ]
+            # numpy.core was renamed to numpy._core in 1.25+. Both modules
+            # expose the same reconstruct helpers; allowlist whichever ships.
+            for _modname in ("numpy._core.multiarray", "numpy.core.multiarray"):
+                try:
+                    _mod = __import__(_modname, fromlist=["_reconstruct", "scalar"])
+                    for _attr in ("_reconstruct", "scalar"):
+                        _fn = getattr(_mod, _attr, None)
+                        if _fn is not None:
+                            allow.append(_fn)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # pathlib types — config files sometimes save cache directories as
+        # Path objects so the checkpoint can be relocated.
+        try:
+            import pathlib
+            allow += [
+                pathlib.PurePath, pathlib.PurePosixPath, pathlib.PureWindowsPath,
+                pathlib.Path, pathlib.PosixPath, pathlib.WindowsPath,
+            ]
+        except Exception:
+            pass
+        if allow:
+            try:
+                add(allow)
+            except Exception as e:
+                logger.debug("add_safe_globals failed (harmless): %s", e)
+
+    def _get_align(self, language_code: str):
+        """Lazy-load the wav2vec2 alignment model for this language. WhisperX
+        bundles aligners for ~20 major languages; for the others we fall back
+        to faster-whisper's native word timestamps (already in result)."""
+        if language_code in self._align_cache:
+            return self._align_cache[language_code]
+        import whisperx
+        try:
+            model, metadata = whisperx.load_align_model(
+                language_code=language_code, device=self._device,
+            )
+            self._align_cache[language_code] = (model, metadata)
+            return model, metadata
+        except Exception as e:
+            logger.info(
+                "whisperx: no alignment model for language=%r (%s); "
+                "falling back to Whisper's native word timestamps",
+                language_code, e,
+            )
+            self._align_cache[language_code] = None
+            return None
+
+    def transcribe(self, audio_path: str, *, word_timestamps: bool = True, language: str | None = None) -> dict:
+        import whisperx  # used for whisperx.align() below
+        self._ensure_asr()
+        logger.info("whisperx transcribing %s (word_timestamps=%s, language=%s)", audio_path, word_timestamps, language)
+        # Decode via OmniVoice's validated ffmpeg, NOT whisperx.load_audio's bare
+        # "ffmpeg" PATH lookup which yields [WinError 193] -> "no segments" on
+        # Windows (#479). Same 16 kHz mono s16le array whisperx expects.
+        audio = _decode_audio_16k_mono(audio_path)
+        try:
+            result = self._asr.transcribe(audio, language=language)
+        except IndexError:
+            # WhisperX pipeline crashes with IndexError if VAD produces 0 segments
+            logger.info("whisperx transcribe threw IndexError (likely 0 VAD segments). Returning empty result.")
+            result = {"segments": [], "language": "en"}
+            
+        lang = result.get("language", "en")
+
+        # Forced alignment when available — drastically improves word boundary
+        # accuracy (±10-30 ms vs Whisper's ±100-300 ms). Skip for rare-language
+        # audio where no wav2vec2 aligner exists.
+        if word_timestamps:
+            align = self._get_align(lang)
+            if align is not None:
+                model_a, metadata = align
+                try:
+                    result = whisperx.align(
+                        result["segments"], model_a, metadata, audio,
+                        self._device, return_char_alignments=False,
+                    )
+                except Exception as e:
+                    logger.warning("whisperx alignment failed: %s — using raw timestamps", e)
+
+        # Normalise to the shape segment_transcript(...) expects: chunks +
+        # segments + language metadata. whisperx's post-align result has
+        # `segments` with `words: [{word, start, end, score}]`.
+        segments = result.get("segments", [])
+        chunks = [
+            {"text": seg.get("text", ""),
+             "timestamp": (seg.get("start"), seg.get("end"))}
+            for seg in segments
+        ]
+        return {
+            "chunks": chunks,
+            "segments": [
+                {
+                    "text": seg.get("text", ""),
+                    "start": seg.get("start"),
+                    "end": seg.get("end"),
+                    "words": seg.get("words", []) if word_timestamps else [],
+                }
+                for seg in segments
+            ],
+            "language": lang,
+        }
+
+    def unload(self) -> None:
+        self._asr = None
+        self._align_cache.clear()
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+# ── Faster-Whisper (cross-platform fallback) ────────────────────────────────
+
+
+class FasterWhisperBackend(ASRBackend):
+    id = "faster-whisper"
+    display_name = "Faster-Whisper (CTranslate2 — Linux/Windows/macOS)"
+    # CTranslate2: CUDA or CPU (no upstream ROCm/HIP build — see WhisperX note).
+    gpu_compat = ("cuda", "cpu")
+
+    def __init__(self):
+        # Defaulting to the CTranslate2-converted large-v3 repo. Matches
+        # KNOWN_MODELS in api/routers/setup.py so the first-run wizard
+        # downloads what the backend will actually load.
+        self._model_name = os.environ.get(
+            "ASR_MODEL_FASTER", "Systran/faster-whisper-large-v3"
+        )
+        self._model = None  # lazy — first transcribe() loads weights
+        # Set by _ensure_model() to the device/compute_type that actually loaded
+        # (after the #551 compute_type / #255 OOM→CPU fallback chain).
+        self._device: str | None = None
+        self._compute_type: str | None = None
+
+    @classmethod
+    def is_available(cls) -> tuple[bool, str]:
+        try:
+            import faster_whisper  # noqa: F401
+            return True, "ready"
+        except ImportError as e:
+            return False, f"faster-whisper not installed: {e}"
+
+    def _ensure_model(self):
+        if self._model is not None:
+            return
+        from faster_whisper import WhisperModel
+        # Device / compute-type auto-pick:
+        #   - CUDA present → GPU fp16
+        #   - Apple Silicon / CPU → CPU int8 (fastest on CPU, negligible
+        #     WER regression vs fp32 for whisper-large-v3)
+        device, compute_type = "cpu", "int8"
+        try:
+            import torch
+            if torch.cuda.is_available():
+                device, compute_type = "cuda", "float16"
+        except Exception:
+            pass
+        logger.info(
+            "faster-whisper loading %s on %s (%s)",
+            self._model_name, device, compute_type,
+        )
+        # Try the per-device compute_type chain (cuda: float16 → int8_float16 →
+        # int8; cpu: int8 → float32). A GPU without efficient fp16 (older
+        # Maxwell/Pascal, GTX 16xx, or a CTranslate2/cuDNN mismatch) raises a
+        # *ValueError* at construction (#551) — degrade to the next candidate
+        # instead of failing every chunk. A genuine CUDA OOM falls back to CPU
+        # (slower, same model/accuracy), preserving the existing #255 behaviour.
+        candidates = _compute_type_candidates(device)
+        if compute_type in candidates:
+            candidates = candidates[candidates.index(compute_type):]
+        last_err: Exception | None = None
+        while True:
+            for ct in candidates:
+                try:
+                    self._model = WhisperModel(
+                        self._model_name, device=device, compute_type=ct
+                    )
+                    self._device, self._compute_type = device, ct
+                    return
+                except (ValueError, RuntimeError) as e:
+                    last_err = e
+                    if _is_compute_type_error(str(e)):
+                        logger.warning(
+                            "faster-whisper %s unsupported on %s — trying next "
+                            "compute_type. Detail: %s", ct, device, e,
+                        )
+                        continue
+                    if device == "cuda" and "out of memory" in str(e).lower():
+                        # Stop scanning GPU candidates; fall back to CPU below.
+                        break
+                    raise
+            # Exhausted candidates for this device. If we were on CUDA and the
+            # last failure was an OOM, retry on CPU with its candidates (#255).
+            if device == "cuda" and last_err is not None and (
+                "out of memory" in str(last_err).lower()
+            ):
+                logger.warning(
+                    "faster-whisper CUDA OOM loading %s — retrying on CPU "
+                    "(slower). Free VRAM (Flush the TTS model) for GPU-speed "
+                    "ASR. Detail: %s", self._model_name, last_err,
+                )
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except Exception:  # noqa: BLE001 — cache clear is best-effort
+                    pass
+                device = "cpu"
+                candidates = _compute_type_candidates(device)
+                compute_type = candidates[0]
+                continue
+            # All candidates exhausted (and no OOM→CPU retry available) — surface
+            # the last error.
+            raise last_err
+
+    def transcribe(self, audio_path: str, *, word_timestamps: bool = True, language: str | None = None) -> dict:
+        self._ensure_model()
+        logger.info(
+            "faster-whisper transcribing %s (word_timestamps=%s, language=%s)",
+            audio_path, word_timestamps, language,
+        )
+        # faster-whisper returns a generator of Segment objects + an Info
+        # struct. Materialise the generator so downstream consumers can
+        # index / re-iterate.
+        segments_iter, info = self._model.transcribe(
+            audio_path,
+            language=language,
+            word_timestamps=word_timestamps,
+            vad_filter=True,  # built-in Silero VAD — cleaner segment starts
+        )
+        segments = list(segments_iter)
+        # Normalise to the shape segment_transcript(...) expects: a dict with
+        # `chunks` (for backwards compat with mlx output) AND `segments` +
+        # `language` (so callers that peek at language metadata keep working).
+        chunks = [
+            {"text": seg.text, "timestamp": (seg.start, seg.end)}
+            for seg in segments
+        ]
+        out = {
+            "chunks": chunks,
+            "segments": [
+                {
+                    "text": seg.text,
+                    "start": seg.start,
+                    "end": seg.end,
+                    "words": (
+                        [
+                            {
+                                "word": w.word,
+                                "start": w.start,
+                                "end": w.end,
+                                "probability": w.probability,
+                            }
+                            for w in (seg.words or [])
+                        ]
+                        if word_timestamps
+                        else []
+                    ),
+                }
+                for seg in segments
+            ],
+            "language": info.language,
+            "language_probability": info.language_probability,
+            "duration": info.duration,
+        }
+        return out
+
+    def unload(self) -> None:
+        self._asr = None
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+# ── MLX Whisper (Apple Silicon optional) ────────────────────────────────────
+
+# Default model for general transcription (dub pipeline etc.)
+_MLX_MODEL_DEFAULT = "mlx-community/whisper-large-v3-mlx"
+# Turbo model for dictation / capture — 5× faster, 0.8B params vs 1.5B.
+_MLX_MODEL_TURBO = "mlx-community/whisper-large-v3-turbo"
+
+
+class MLXWhisperBackend(ASRBackend):
+    id = "mlx-whisper"
+    display_name = "MLX Whisper (Apple Silicon CoreML)"
+    gpu_compat = ("mps", "cpu")
+
+    def __init__(self, model_name: str | None = None):
+        self._model_name = model_name or os.environ.get(
+            "ASR_MODEL", _MLX_MODEL_DEFAULT,
+        )
+
+    @classmethod
+    def is_available(cls) -> tuple[bool, str]:
+        # #390: shared platform gate FIRST — one rule for MLX-Audio + MLX-Whisper.
+        # Returns False on Linux/Windows/mac-Intel before any package import, so
+        # a stray mlx-whisper wheel never reports available or advertises `mps`.
+        from core.device_caps import mlx_supported
+        ok, why = mlx_supported()
+        if not ok:
+            return False, why
+        try:
+            import mlx_whisper  # noqa: F401
+            return True, "ready"
+        # Catch OSError/RuntimeError too, not just ImportError: in a
+        # PyInstaller bundle mlx's native dylib/metallib can fail to load
+        # even when the package imports, raising OSError/RuntimeError. We must
+        # report unavailable (so the picker falls back) rather than crash the
+        # registry scan (Wave 4.4).
+        except (ImportError, OSError, RuntimeError) as e:
+            return False, f"mlx-whisper unavailable: {e}"
+
+    def transcribe(self, audio_path: str, *, word_timestamps: bool = True, language: str | None = None) -> dict:
+        import mlx_whisper
+        logger.info(
+            "MLX Whisper transcribing %s (model=%s, word_timestamps=%s, language=%s)",
+            audio_path, self._model_name, word_timestamps, language,
+        )
+        result = mlx_whisper.transcribe(
+            audio_path,
+            path_or_hf_repo=self._model_name,
+            word_timestamps=word_timestamps,
+            language=language,
+        )
+        # Normalise to the `chunks` shape the rest of the pipeline expects.
+        if "segments" in result and "chunks" not in result:
+            result["chunks"] = [
+                {"text": seg["text"], "timestamp": (seg["start"], seg["end"])}
+                for seg in result["segments"]
+            ]
+        return result
+
+    def warmup(self) -> None:
+        """Eagerly load model weights into memory so first transcribe is instant.
+
+        mlx_whisper internally caches via a class-level ModelHolder singleton.
+        Calling ``load_model`` triggers the download (if needed) and loads
+        weights onto the GPU — subsequent transcribe() calls hit the warm cache.
+        """
+        import time
+        t0 = time.perf_counter()
+        try:
+            from mlx_whisper.transcribe import ModelHolder
+            import mlx.core as mx
+            # load_model populates the class-level singleton; after this call
+            # the model is resident in unified memory.
+            ModelHolder.get_model(self._model_name, dtype=mx.float16)
+            dt = time.perf_counter() - t0
+            logger.info("MLX Whisper model '%s' warmed up in %.1fs", self._model_name, dt)
+        except Exception as e:
+            dt = time.perf_counter() - t0
+            logger.warning("MLX Whisper warmup failed after %.1fs: %s", dt, e)
+
+
+# ── PyTorch Whisper fallback (CUDA / CPU via pipeline) ─────────────────────
+
+
+class PyTorchWhisperBackend(ASRBackend):
+    id = "pytorch-whisper"
+    display_name = "PyTorch Whisper (CUDA / CPU via transformers pipeline)"
+    # Pure transformers pipeline → runs wherever torch does (CUDA, MPS, CPU).
+    # ROCm-via-HIP would also work but is left unclaimed pending verification.
+    gpu_compat = ("cuda", "mps", "cpu")
+
+    def __init__(self, asr_pipe=None):
+        # Reuses the `_asr_pipe` attached to the TTS model when available.
+        self._pipe = asr_pipe
+
+    @classmethod
+    def is_available(cls) -> tuple[bool, str]:
+        try:
+            import transformers  # noqa: F401
+            return True, "ready"
+        except ImportError as e:
+            return False, f"transformers not installed: {e}"
+
+    def _ensure_pipe(self):
+        if self._pipe is not None:
+            return
+        # Build a standalone transformers Whisper pipeline on demand. This runs
+        # on PyTorch's own stack (cuDNN 9 ships with torch), so it works as a
+        # fallback on machines where WhisperX / faster-whisper can't load
+        # cuDNN 8 (the `cudnn_ops_infer64_8.dll` failure, issue #255) — and it
+        # needs neither OMNIVOICE_PRELOAD_TTS_ASR=1 nor a loaded TTS model.
+        # When the TTS model already has an ASR head, dub_core passes it via the
+        # constructor and this path is skipped.
+        import torch
+        from transformers import pipeline as hf_pipeline
+        from services.model_manager import get_best_device
+
+        model_name = os.environ.get(
+            "OMNIVOICE_PYTORCH_ASR_MODEL", "openai/whisper-large-v3-turbo"
+        )
+        device = get_best_device()
+        asr_dtype = torch.float16 if str(device).startswith("cuda") else torch.float32
+        logger.info(
+            "PyTorchWhisperBackend: loading standalone ASR pipeline %s on %s",
+            model_name, device,
+        )
+        try:
+            self._pipe = hf_pipeline(
+                "automatic-speech-recognition",
+                model=model_name,
+                dtype=asr_dtype,
+                device_map=device,
+            )
+        except Exception as e:
+            # #549: an incomplete transformers install fails to build the ASR
+            # pipeline (e.g. "Could not import module 'AutoFeatureExtractor'").
+            # The raw error is opaque; re-raise with an actionable next step so
+            # the toast tells the user how to recover instead of "no segments".
+            raise RuntimeError(
+                "transformers ASR pipeline failed to import (AutoFeatureExtractor) "
+                "— your transformers install is incomplete; reinstall with "
+                "`uv pip install --reinstall transformers`, or use faster-whisper "
+                "(OmniVoice's default ASR) which avoids the transformers pipeline. "
+                f"Underlying: {e}"
+            ) from e
+
+    def transcribe(self, audio_path: str, *, word_timestamps: bool = True, language: str | None = None) -> dict:
+        import soundfile as sf
+        import torch
+        self._ensure_pipe()
+        audio_np, sr = sf.read(audio_path, dtype="float32")
+        if audio_np.ndim > 1:
+            audio_np = audio_np.mean(axis=1)
+        bs = 16 if torch.cuda.is_available() else 2
+        generate_kwargs = {}
+        if language:
+            generate_kwargs["language"] = language
+        result = self._pipe(
+            {"array": audio_np, "sampling_rate": sr},
+            return_timestamps="word" if word_timestamps else True,
+            chunk_length_s=15,
+            batch_size=bs,
+            generate_kwargs=generate_kwargs,
+        )
+        return result if isinstance(result, dict) else {"chunks": [], "raw": result}
+
+
+# ── NeMo Parakeet TDT (NVIDIA — English SOTA from ASR Leaderboard) ─────────
+
+
+class NeMoASRBackend(ASRBackend):
+    """NVIDIA Parakeet TDT via NeMo toolkit.
+
+    FastConformer encoder + Token-and-Duration Transducer decoder.
+    Beats Whisper large-v3 on English benchmarks (~6% WER).
+    Supports 25+ European languages with auto language detection.
+    Requires NVIDIA GPU.
+    """
+    id = "nemo-parakeet"
+    # CUDA-only: is_available() hard-fails without a GPU ("Parakeet TDT requires
+    # NVIDIA GPU (CUDA)"), so declaring a CPU path would be a false claim. On a
+    # CPU host this correctly resolves to routing_status="unavailable", matching
+    # is_available()=False (the matrix suppresses the routing badge there).
+    gpu_compat = ("cuda",)
+    display_name = "Parakeet TDT (NVIDIA NeMo — English SOTA)"
+
+    def __init__(self):
+        self._model_name = os.environ.get(
+            "ASR_MODEL_NEMO", "nvidia/parakeet-tdt-0.6b-v3"
+        )
+        self._model = None
+
+    @classmethod
+    def is_available(cls) -> tuple[bool, str]:
+        try:
+            import torch
+            if not torch.cuda.is_available():
+                return False, "Parakeet TDT requires NVIDIA GPU (CUDA)"
+        except ImportError:
+            return False, "PyTorch not installed"
+        try:
+            import nemo.collections.asr  # noqa: F401
+            return True, "ready"
+        except ImportError as e:
+            return False, f"nemo_toolkit[asr] not installed: {e}"
+
+    def _ensure_model(self):
+        if self._model is not None:
+            return
+        import nemo.collections.asr as nemo_asr
+        logger.info("NeMo loading %s", self._model_name)
+        self._model = nemo_asr.models.ASRModel.from_pretrained(
+            model_name=self._model_name
+        )
+
+    def transcribe(self, audio_path: str, *, word_timestamps: bool = True, language: str | None = None) -> dict:
+        self._ensure_model()
+        logger.info(
+            "NeMo Parakeet transcribing %s (word_timestamps=%s)",
+            audio_path, word_timestamps,
+        )
+        outputs = self._model.transcribe(
+            [audio_path], timestamps=word_timestamps
+        )
+        # NeMo returns a list of Hypothesis objects with .text and optional
+        # .timestep / .alignments. Normalise to OmniVoice's expected shape.
+        hyp = outputs[0] if outputs else None
+        if hyp is None:
+            return {"chunks": [], "segments": [], "language": "en"}
+
+        text = hyp.text if hasattr(hyp, "text") else str(hyp)
+
+        # Extract word-level timestamps if available
+        words = []
+        segments_out = []
+        if word_timestamps and hasattr(hyp, "timestep") and hyp.timestep:
+            try:
+                # NeMo timestep format varies by model version
+                ts = hyp.timestep
+                if isinstance(ts, dict) and "word" in ts:
+                    for w in ts["word"]:
+                        words.append({
+                            "word": w.get("char", w.get("word", "")),
+                            "start": w.get("start_offset", 0),
+                            "end": w.get("end_offset", 0),
+                        })
+            except Exception as e:
+                logger.debug("NeMo timestamp extraction: %s", e)
+
+        # Build a single segment from the full transcription
+        # (NeMo doesn't natively split into VAD segments like Whisper)
+        if text.strip():
+            segments_out.append({
+                "text": text,
+                "start": words[0]["start"] if words else 0.0,
+                "end": words[-1]["end"] if words else None,
+                "words": words,
+            })
+
+        chunks = [
+            {"text": seg["text"], "timestamp": (seg["start"], seg["end"])}
+            for seg in segments_out
+        ]
+        return {
+            "chunks": chunks,
+            "segments": segments_out,
+            "language": "en",  # Parakeet v3 auto-detects but doesn't expose it cleanly
+        }
+
+    def unload(self) -> None:
+        self._model = None
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+# ── Moonshine (edge-optimized, variable-length — from ASR Leaderboard) ─────
+
+
+class MoonshineASRBackend(ASRBackend):
+    """Moonshine ASR via moonshine-voice or ONNX runtime.
+
+    Optimized for edge/CPU deployment. Variable-length processing
+    (no 30s padding waste like Whisper). Sub-200ms latency.
+    Great for live capture and CPU-only environments.
+    """
+    id = "moonshine"
+    gpu_compat = ("cpu",)  # edge/CPU-optimized by design
+    display_name = "Moonshine (edge-optimized, ONNX)"
+
+    def __init__(self):
+        self._model_name = os.environ.get(
+            "ASR_MODEL_MOONSHINE", "moonshine/base"
+        )
+        self._transcriber = None
+
+    @classmethod
+    def is_available(cls) -> tuple[bool, str]:
+        try:
+            import moonshine_onnx  # noqa: F401
+            return True, "ready (moonshine_onnx)"
+        except ImportError:
+            pass
+        try:
+            from moonshine_voice import Transcriber  # noqa: F401
+            return True, "ready (moonshine_voice)"
+        except ImportError:
+            pass
+        return False, (
+            "moonshine not installed. Install with: "
+            "uv pip install moonshine-onnx  (or moonshine-voice)"
+        )
+
+    def transcribe(self, audio_path: str, *, word_timestamps: bool = True, language: str | None = None) -> dict:
+        logger.info(
+            "Moonshine transcribing %s (model=%s)",
+            audio_path, self._model_name,
+        )
+        # Try moonshine_onnx first (lighter), then moonshine_voice
+        try:
+            import moonshine_onnx
+            text = moonshine_onnx.transcribe(audio_path, model=self._model_name)
+            if isinstance(text, list):
+                text = " ".join(text)
+        except ImportError:
+            from moonshine_voice import Transcriber
+            if self._transcriber is None:
+                self._transcriber = Transcriber(model=self._model_name)
+            text = self._transcriber.transcribe_file(audio_path)
+            if isinstance(text, list):
+                text = " ".join(text)
+
+        # Moonshine returns plain text without timestamps in basic mode.
+        # Build minimal segments structure.
+        segments_out = []
+        if text and text.strip():
+            # Get audio duration for rough segment bounds
+            try:
+                import soundfile as sf
+                info = sf.info(audio_path)
+                duration = info.duration
+            except Exception:
+                duration = None
+
+            segments_out.append({
+                "text": text.strip(),
+                "start": 0.0,
+                "end": duration,
+                "words": [],
+            })
+
+        chunks = [
+            {"text": seg["text"], "timestamp": (seg["start"], seg["end"])}
+            for seg in segments_out
+        ]
+        return {
+            "chunks": chunks,
+            "segments": segments_out,
+            "language": "en",
+        }
+
+    def unload(self) -> None:
+        self._transcriber = None
+
+
+# ── Registry ────────────────────────────────────────────────────────────────
+
+
+# ── FunASR (SenseVoice — all-in-one multilingual, opt-in alternative, #182) ──
+
+# SenseVoice emits rich tokens like `<|en|><|NEUTRAL|><|Speech|>` around the
+# text; strip them when no postprocessor is applied.
+_FUNASR_TAG_RE = re.compile(r"<\|[^|>]*\|>")
+
+
+def _ms_to_s(value):
+    """Milliseconds → seconds (FunASR reports ms). None on bad input."""
+    try:
+        return round(float(value) / 1000.0, 3)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean_funasr_text(text):
+    return _FUNASR_TAG_RE.sub("", str(text or "")).strip()
+
+
+def _normalize_funasr(res) -> dict:
+    """Normalise FunASR ``generate()`` output → OmniVoice's
+    ``{chunks, segments, language}`` shape (the same one the Whisper backends
+    return, consumed by ``services.segmentation``). Defensive about FunASR's
+    output variations: prefers VAD ``sentence_info`` (ms timestamps + optional
+    ``spk`` speaker id) and falls back to a single utterance from ``text``.
+    Pure — testable without funasr installed.
+    """
+    item = (res[0] if isinstance(res, (list, tuple)) and res else res) or {}
+    if not isinstance(item, dict):
+        item = {"text": str(item)}
+    language = item.get("language") or item.get("lang") or None
+
+    segments = []
+    for s in item.get("sentence_info") or []:
+        if not isinstance(s, dict):
+            continue
+        txt = _clean_funasr_text(s.get("text", ""))
+        if not txt:
+            continue
+        seg = {"text": txt, "start": _ms_to_s(s.get("start", 0)) or 0.0, "end": _ms_to_s(s.get("end"))}
+        spk = s.get("spk")
+        if spk is not None:
+            seg["speaker"] = f"Speaker {int(spk) + 1}" if isinstance(spk, (int, float)) else str(spk)
+        segments.append(seg)
+
+    if not segments:
+        txt = _clean_funasr_text(item.get("text", ""))
+        if txt:
+            ts = item.get("timestamp") or []  # [[start_ms, end_ms], ...]
+            start = _ms_to_s(ts[0][0]) if ts else 0.0
+            end = _ms_to_s(ts[-1][1]) if ts else None
+            segments.append({"text": txt, "start": start or 0.0, "end": end})
+
+    chunks = [{"text": seg["text"], "timestamp": (seg["start"], seg.get("end"))} for seg in segments]
+    return {"chunks": chunks, "segments": segments, "language": language}
+
+
+class FunASRBackend(ASRBackend):
+    """FunASR — SenseVoiceSmall + FSMN-VAD. All-in-one multilingual ASR:
+    transcription + punctuation across 50+ languages, with optional speaker
+    diarization via the cam++ model. Opt-in alternative to WhisperX (issue
+    #182); WhisperX remains the cross-platform default.
+    """
+    id = "funasr"
+    gpu_compat = ("cuda", "cpu")  # FunASR: CUDA or CPU
+    display_name = "FunASR (SenseVoice — 50+ languages, all-in-one)"
+
+    def __init__(self):
+        self._model_name = os.environ.get("ASR_MODEL_FUNASR", "iic/SenseVoiceSmall")
+        self._vad_model = os.environ.get("ASR_FUNASR_VAD", "fsmn-vad")
+        # cam++ speaker model → inline diarization (Phase 2). Set ASR_FUNASR_SPK=""
+        # to disable and fall back to the dub pipeline's pyannote/heuristic path.
+        self._spk_model = os.environ.get("ASR_FUNASR_SPK", "cam++")
+        self._model = None
+
+    @classmethod
+    def is_available(cls) -> tuple[bool, str]:
+        try:
+            import funasr  # noqa: F401
+            return True, "ready"
+        except ImportError:
+            return False, "funasr not installed. Install with: uv pip install funasr"
+
+    def _ensure_model(self):
+        if self._model is not None:
+            return
+        from funasr import AutoModel
+        kwargs = {"model": self._model_name, "vad_model": self._vad_model, "disable_update": True}
+        if self._spk_model:
+            kwargs["spk_model"] = self._spk_model
+        logger.info("FunASR loading %s (vad=%s, spk=%s)", self._model_name, self._vad_model, self._spk_model or "off")
+        self._model = AutoModel(**kwargs)
+
+    def transcribe(self, audio_path: str, *, word_timestamps: bool = True, language: str | None = None) -> dict:
+        self._ensure_model()
+        logger.info("FunASR transcribing %s (language=%s)", audio_path, language)
+        lang = language or "auto"
+        res = self._model.generate(input=audio_path, cache={}, language=lang, use_itn=True)
+        return _normalize_funasr(res)
+
+    def unload(self) -> None:
+        self._model = None
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def _isolated_faster_whisper():
+    """Lazy import so the subprocess_asr → subprocess_backend chain isn't
+    pulled in at registry definition time."""
+    from services.subprocess_asr import IsolatedFasterWhisperBackend
+    return IsolatedFasterWhisperBackend
+
+
+class _LazyASRRegistry(dict):
+    """Registry with one lazily-resolved entry (Wave 4.2). Mirrors the TTS
+    registry's lazy pattern so listing/selecting the crash-isolated ASR
+    backend doesn't import the subprocess stack unless it's used."""
+
+    _LAZY = {"faster-whisper-isolated": _isolated_faster_whisper}
+
+    def __contains__(self, key):
+        return dict.__contains__(self, key) or key in self._LAZY
+
+    def __getitem__(self, key):
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        if key in self._LAZY:
+            cls = self._LAZY[key]()
+            self[key] = cls
+            return cls
+        raise KeyError(key)
+
+    def __iter__(self):
+        seen = set()
+        for k in dict.__iter__(self):
+            seen.add(k)
+            yield k
+        for k in self._LAZY:
+            if k not in seen:
+                yield k
+
+    def items(self):
+        for k in self:
+            yield k, self[k]
+
+
+_REGISTRY: dict[str, type[ASRBackend]] = _LazyASRRegistry({
+    "whisperx":        WhisperXBackend,
+    "faster-whisper":  FasterWhisperBackend,
+    "mlx-whisper":     MLXWhisperBackend,
+    "pytorch-whisper": PyTorchWhisperBackend,
+    "nemo-parakeet":   NeMoASRBackend,
+    "moonshine":       MoonshineASRBackend,
+    "funasr":          FunASRBackend,
+    # "faster-whisper-isolated": resolved lazily (crash-isolated subprocess).
+})
+
+
+# Short install hints surfaced as tooltips on the Settings → Engines UI
+# (parity with tts_backend._INSTALL_HINTS).
+_INSTALL_HINTS: dict[str, str] = {
+    "whisperx":        "pip install whisperx  (CTranslate2 + wav2vec2 alignment; CUDA or CPU)",
+    "faster-whisper":  "pip install faster-whisper  (CTranslate2; cross-platform, CUDA or CPU)",
+    "mlx-whisper":     "pip install mlx-whisper  (Apple Silicon only)",
+    "pytorch-whisper": "Bundled with transformers — no extra install (CUDA/MPS/CPU)",
+    "nemo-parakeet":   "pip install nemo_toolkit[asr]  (NVIDIA Parakeet; CUDA or CPU)",
+    "moonshine":       "pip install useful-moonshine  (edge/CPU-optimized ASR)",
+    "funasr":          "pip install funasr  (SenseVoiceSmall + FSMN-VAD; CUDA or CPU)",
+}
+
+# Most-recent failure per backend, so a transient probe error survives between
+# Settings refreshes (parity with tts_backend._LAST_ERRORS).
+_LAST_ERRORS: dict[str, str] = {}
+
+
+def list_backends() -> list[dict]:
+    """Enumerate every ASR backend with the **same 11-key shape as TTS** so the
+    Engine Compatibility Matrix renders all families uniformly.
+
+    Per-entry: id, display_name, available, reason (scrubbed), install_hint,
+    last_error, isolation_mode, gpu_compat, effective_device, routing_status,
+    routing_reason. A backend whose ``is_available()`` raises is reported
+    ``available: false`` (never a 500), exactly like TTS.
+    """
+    from core.device_caps import detect_host_caps
+    from core.scrub import scrub_text
+    from services.engine_routing import routing_fields
+    caps = detect_host_caps()
+
+    out: list[dict] = []
+    for bid, cls in _REGISTRY.items():
+        try:
+            ok, msg = cls.is_available()
+        except Exception as exc:
+            ok = False
+            msg = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "asr list_backends: %s.is_available() raised — degrading "
+                "gracefully so the picker still renders: %s", bid, msg,
+            )
+        if ok:
+            _LAST_ERRORS.pop(bid, None)
+        else:
+            _LAST_ERRORS[bid] = scrub_text(msg)
+        isolation = "subprocess" if getattr(cls, "_is_subprocess_isolated", False) else "in-process"
+        gpu_compat = getattr(cls, "gpu_compat", ("cpu",))
+        out.append({
+            "id": bid,
+            "display_name": cls.display_name,
+            "available": ok,
+            # ASR previously emitted `reason` UNMASKED — scrub it now (closes a
+            # pre-existing token-leak gap, matching TTS's redaction guarantee).
+            "reason": None if ok else scrub_text(msg),
+            "install_hint": _INSTALL_HINTS.get(bid),
+            "last_error": _LAST_ERRORS.get(bid),
+            "isolation_mode": isolation,
+            "gpu_compat": list(gpu_compat),
+            **routing_fields(gpu_compat, caps),
+        })
+    return out
+
+
+def _auto_detect() -> str:
+    """Pick the best available ASR engine for the current hardware.
+
+    Preference order:
+      - Mac Apple Silicon: mlx-whisper (if available) -> whisperx -> faster-whisper
+      - Windows / Linux: whisperx -> faster-whisper
+    """
+    from core.device_caps import mlx_supported
+    is_mac_arm = False
+    try:
+        ok, _ = mlx_supported()
+        if ok:
+            is_mac_arm = True
+    except Exception:
+        pass
+
+    if is_mac_arm:
+        ok, _ = MLXWhisperBackend.is_available()
+        if ok:
+            return "mlx-whisper"
+
+    ok, _ = WhisperXBackend.is_available()
+    if ok:
+        return "whisperx"
+    ok, _ = FasterWhisperBackend.is_available()
+    if ok:
+        return "faster-whisper"
+
+    if is_mac_arm:
+        ok, _ = MLXWhisperBackend.is_available()
+        if ok:
+            return "mlx-whisper"
+
+    return "pytorch-whisper"
+
+
+def active_backend_id() -> str:
+    explicit = os.environ.get("OMNIVOICE_ASR_BACKEND")
+    if explicit:
+        return explicit
+    from core import prefs
+    picked = prefs.get("asr_backend")
+    
+    # Prioritize whisperx as the default if available.
+    # If the user has not explicitly set a preference, or if the preference is faster-whisper
+    # (which was the old fallback/default) and whisperx is now available, prefer whisperx.
+    ok_wx, _ = WhisperXBackend.is_available()
+    if ok_wx and (not picked or picked == "faster-whisper"):
+        return "whisperx"
+
+    if picked:
+        return picked
+    return _auto_detect()
+
+
+def get_active_asr_backend(*, asr_pipe=None) -> ASRBackend:
+    bid = active_backend_id()
+    if bid == "pytorch-whisper":
+        return PyTorchWhisperBackend(asr_pipe=asr_pipe)
+    if bid == "mlx-whisper":
+        return MLXWhisperBackend()
+    if bid == "faster-whisper":
+        return FasterWhisperBackend()
+    if bid == "whisperx":
+        return WhisperXBackend()
+    if bid not in _REGISTRY:
+        raise ValueError(f"Unknown ASR backend: {bid!r}. Known: {list(_REGISTRY)}")
+    return _REGISTRY[bid]()
+
+
+def transcribe_reference(audio_path: str) -> str | None:
+    """Transcribe a voice-clone reference clip with the active ASR backend.
+
+    Voice cloning without a user-supplied transcript used to fall through to
+    ``OmniVoice.load_asr_model()`` — a transformers ``pipeline()`` load of
+    whisper-large-v3-turbo that fails outright on transformers 5.3 (#308),
+    even when whisperx / faster-whisper / mlx-whisper are installed and
+    working. Route the reference transcript through the registry instead, so
+    the model-attached pipeline is only reached when it is genuinely the last
+    resort. Returns ``None`` on any failure — callers pass ``ref_text=None``
+    through and the model's built-in fallback still gets its chance.
+    """
+    try:
+        backend = get_active_asr_backend()
+    except Exception as e:  # noqa: BLE001 — never let ASR break generation
+        logger.warning("transcribe_reference: no ASR backend available (%s)", e)
+        return None
+    if isinstance(backend, PyTorchWhisperBackend):
+        # The registry fell through to the model-attached pipeline; let the
+        # model load it lazily rather than constructing a second copy here.
+        return None
+    try:
+        result = backend.transcribe(audio_path, word_timestamps=False)
+    except Exception as e:  # noqa: BLE001 — degrade to the model fallback
+        logger.warning(
+            "transcribe_reference: %s failed (%s) — deferring to the model's "
+            "built-in ASR fallback",
+            backend.id, e,
+        )
+        return None
+    result = result or {}
+    text = result.get("text") or " ".join(
+        (seg.get("text") or "").strip() for seg in result.get("segments", [])
+    )
+    text = (text or "").strip()
+    return text or None
+
+
+_capture_backend: ASRBackend | None = None
+
+
+def get_capture_asr_backend() -> ASRBackend:
+    """Pick the fastest ASR engine for capture / dictation.
+
+    Priority order (speed-first — word alignment is unnecessary for
+    dictation, so we skip WhisperX's forced-alignment overhead):
+
+      1. mlx-whisper Turbo  — Apple Silicon, ~5× faster than large-v3
+      2. mlx-whisper large  — still native Metal, faster than CPU int8
+      3. faster-whisper     — cross-platform CTranslate2 fallback
+      4. pytorch-whisper    — last resort
+
+    The caller should also pass ``word_timestamps=False`` to the returned
+    backend to skip per-word timing and shave another ~30% latency.
+
+    Returns a cached singleton so the model stays warm between calls.
+    """
+    global _capture_backend
+    if _capture_backend is not None:
+        return _capture_backend
+
+    # Prefer MLX Turbo on Apple Silicon
+    ok, _ = MLXWhisperBackend.is_available()
+    if ok:
+        _capture_backend = MLXWhisperBackend(model_name=_MLX_MODEL_TURBO)
+        return _capture_backend
+
+    # Fall back to faster-whisper (CPU int8 on non-Apple)
+    ok, _ = FasterWhisperBackend.is_available()
+    if ok:
+        _capture_backend = FasterWhisperBackend()
+        return _capture_backend
+
+    # Last resort
+    _capture_backend = PyTorchWhisperBackend()
+    return _capture_backend

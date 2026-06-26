@@ -1,0 +1,425 @@
+"""
+Streaming ASR via WebSocket — live partial transcription results.
+
+Client streams audio chunks (PCM/WebM) and receives partial + final
+transcription JSON messages in real-time. Used by CaptureButton for
+live dictation feedback.
+
+Protocol:
+    → Client sends binary audio frames (16-bit PCM or WebM/Opus blobs)
+    ← Server sends JSON messages:
+
+    Opt-in AEC mode (``?aec=1[&sr=16000]``, parity Action 8b): for dictating
+    while the app plays audio. Frames must be raw int16 mono PCM, each tagged
+    with a 1-byte prefix — 0x00 = microphone, 0x01 = playback reference. The
+    server runs an NLMS echo canceller, cleaning the mic against the reference
+    before transcription. Without the param the protocol is unchanged.
+        {"type": "partial", "text": "Hello wor..."}      — interim result
+        {"type": "final",   "text": "Hello world.",       — committed result
+         "segments": [...], "language": "en",
+         "duration_s": 4.2, "transcription_time_s": 0.8,
+         "engine": "mlx-whisper"}
+        {"type": "error",   "detail": "..."}              — error
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import tempfile
+import time
+
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+
+from api.dependencies import _LOOPBACK_HOSTS, ws_remote_authorized
+
+router = APIRouter()
+logger = logging.getLogger("omnivoice.capture_ws")
+
+# How often (seconds) to run transcription on the accumulated buffer.
+# Shorter = more responsive but more GPU load.
+PARTIAL_INTERVAL_S = float(os.environ.get("OMNIVOICE_STREAM_INTERVAL", "2.0"))
+
+# Maximum silence before we auto-finalize (seconds of no new audio).
+SILENCE_TIMEOUT_S = float(os.environ.get("OMNIVOICE_STREAM_SILENCE", "3.0"))
+
+# Minimum buffer size before first partial (bytes of raw audio).
+MIN_BUFFER_BYTES = 64000  # ~2s of 16-bit mono 16kHz — needs enough WebM frames for ffmpeg
+
+# Minimum buffer for final transcription — much lower since we always want
+# to transcribe whatever the user recorded, even short utterances.
+MIN_FINAL_BUFFER_BYTES = 4000  # ~125ms of 16-bit mono 16kHz
+
+# ── Dictate-over-playback AEC (parity Action 8b, opt-in) ──────────────────
+# Activated by the ``?aec=1`` query param. When OFF (the default), the
+# protocol and behaviour are byte-for-byte unchanged. When ON, the client
+# streams raw int16 mono PCM frames tagged with a 1-byte type prefix so the
+# server can tell mic audio from the playback reference it must cancel:
+_AEC_NEAR = 0x00  # microphone frame (clean it, then buffer for ASR)
+_AEC_FAR = 0x01   # playback reference frame (feed the echo model only)
+
+
+def _demux_aec_frame(data: bytes) -> tuple[str, bytes]:
+    """Split a prefixed AEC binary frame into ``(kind, pcm)``.
+
+    ``kind`` is ``"near"`` (mic) or ``"far"`` (playback reference). An empty
+    or prefix-only frame yields an empty payload. Unknown prefixes are treated
+    as ``"near"`` so a malformed tag degrades to plain dictation rather than
+    dropping audio.
+    """
+    if not data:
+        return "near", b""
+    kind = "far" if data[0] == _AEC_FAR else "near"
+    return kind, data[1:]
+
+
+def _pcm16_to_wav(pcm: bytes, sample_rate: int) -> str | None:
+    """Write raw int16 mono PCM to a temp WAV via stdlib ``wave`` (no ffmpeg).
+
+    Used on the AEC path, where frames are already decoded PCM — the cleaned
+    samples have no container, so the ffmpeg-sniffing ``_chunks_to_wav`` would
+    misdetect them. Returns the temp path, or ``None`` for a too-short buffer.
+    """
+    if not pcm or len(pcm) < 100:
+        return None
+    import wave
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    tmp.close()
+    try:
+        with wave.open(tmp.name, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # int16
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm)
+        return tmp.name
+    except Exception as e:
+        logger.debug("PCM->WAV failed: %s", e)
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+        return None
+
+
+@router.websocket("/ws/transcribe")
+async def ws_transcribe(websocket: WebSocket):
+    """Stream audio in, get partial + final transcription out."""
+    # Loopback origin guard — refuse anything not from 127.0.0.1, ::1, or
+    # localhost. HTTP routers use Depends(require_loopback) at router level;
+    # WebSocket dependency injection differs across FastAPI versions, so we
+    # inline the check before accept(). Without it, any local process could
+    # stream the user's microphone over this endpoint.
+    # Wave 2.3 (remote backend): a non-loopback client that presents the
+    # OMNIVOICE_API_KEY bearer is the thin-client dictation case — the mic
+    # lives on the user's machine, the GPU here — and is allowed through.
+    host = websocket.client.host if websocket.client else None
+    if host not in _LOOPBACK_HOSTS and not ws_remote_authorized(websocket):
+        await websocket.close(code=1008, reason="loopback origin required")
+        return
+
+    await websocket.accept()
+
+    # Opt-in dictate-over-playback AEC (parity Action 8b). Default OFF →
+    # identical legacy behaviour. When on, frames are 1-byte-tagged raw PCM
+    # and the cleaned mic stream is muxed via stdlib wave (not ffmpeg).
+    aec = None
+    pcm_sr: int | None = None
+    if websocket.query_params.get("aec") in ("1", "true", "on"):
+        try:
+            pcm_sr = int(websocket.query_params.get("sr", "16000"))
+            from services.aec import NlmsEchoCanceller
+            aec = NlmsEchoCanceller(sample_rate=pcm_sr)
+            logger.info("AEC enabled for dictation session (sr=%d)", pcm_sr)
+        except Exception as e:
+            # Bad sr or import failure → fall back to plain dictation.
+            logger.warning("AEC requested but disabled: %s", e)
+            aec = None
+            pcm_sr = None
+
+    audio_chunks: list[bytes] = []
+    total_bytes = 0
+    last_audio_time = time.monotonic()
+    running = True
+    partial_text = ""
+    # Track whether the client initiated the disconnect. When True the
+    # WebSocket is already in a closed/closing state and any attempt to
+    # call `send_json()` will raise "Unexpected ASGI message".
+    client_disconnected = False
+
+    async def receive_audio():
+        """Receive audio frames from the client.
+
+        Two end-of-stream signals: (a) text frame ``"EOF"`` (preferred —
+        keeps the socket open so the ``final`` message can still be sent
+        before the client closes), or (b) socket disconnect (legacy path).
+        The EOF protocol exists so the client can use the WS ``final``
+        message as the authoritative result and skip the duplicate HTTP
+        POST that used to run on every dictation.
+        """
+        nonlocal total_bytes, last_audio_time, running, client_disconnected
+        try:
+            while running:
+                msg = await websocket.receive()
+                msg_type = msg.get("type")
+                if msg_type == "websocket.disconnect":
+                    client_disconnected = True
+                    running = False
+                    break
+                if msg_type != "websocket.receive":
+                    continue
+                data = msg.get("bytes")
+                if data is not None:
+                    if len(data) == 0:
+                        # Empty binary frame also acts as EOF — connection stays open.
+                        running = False
+                        break
+                    if aec is not None:
+                        # Tagged PCM: route the playback reference into the echo
+                        # model and clean the mic before it reaches the buffer.
+                        kind, payload = _demux_aec_frame(data)
+                        if kind == "far":
+                            aec.push_far_end(payload)
+                            continue
+                        if not payload:
+                            continue
+                        data = aec.process_near_end(payload)
+                    audio_chunks.append(data)
+                    total_bytes += len(data)
+                    last_audio_time = time.monotonic()
+                    continue
+                if msg.get("text") == "EOF":
+                    # Client signals end-of-audio but stays connected for `final`.
+                    running = False
+                    break
+        except WebSocketDisconnect:
+            client_disconnected = True
+            running = False
+        except Exception as e:
+            logger.debug("WS receive ended: %s", e)
+            client_disconnected = True
+            running = False
+
+    async def _safe_send(payload: dict) -> bool:
+        """Send JSON to the client, returning False if the connection is gone."""
+        if client_disconnected:
+            return False
+        try:
+            await websocket.send_json(payload)
+            return True
+        except Exception:
+            return False
+
+    async def process_partials():
+        """Periodically transcribe the accumulated buffer for partial results."""
+        nonlocal partial_text, running
+
+        while running:
+            await asyncio.sleep(PARTIAL_INTERVAL_S)
+
+            if not running:
+                break
+
+            # Check silence timeout
+            if time.monotonic() - last_audio_time > SILENCE_TIMEOUT_S and total_bytes > MIN_BUFFER_BYTES:
+                running = False
+                break
+
+            if total_bytes < MIN_BUFFER_BYTES:
+                continue
+
+            # Transcribe current buffer
+            try:
+                text = await _transcribe_buffer(audio_chunks[:], pcm_sr=pcm_sr)
+                if text and text != partial_text:
+                    partial_text = text
+                    await _safe_send({
+                        "type": "partial",
+                        "text": text,
+                    })
+            except Exception as e:
+                logger.warning("Partial transcription failed: %s", e)
+
+    # Run receiver and processor concurrently
+    receiver_task = asyncio.create_task(receive_audio())
+    processor_task = asyncio.create_task(process_partials())
+
+    # Wait for either to finish (receiver ends on disconnect, processor on silence)
+    done, pending = await asyncio.wait(
+        [receiver_task, processor_task],
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    running = False
+    for task in pending:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    # Final transcription on complete buffer — skip if client already gone.
+    if total_bytes > MIN_FINAL_BUFFER_BYTES:
+        try:
+            result = await _transcribe_buffer_full(audio_chunks, pcm_sr=pcm_sr)
+            # Wave 2.1: optional local-LLM refinement of the final text.
+            # Off-thread (network call, not GPU); pass-through on any
+            # failure or when no LLM backend is configured. The raw text
+            # always ships too — clients paste refined_text ?? text.
+            if result.get("text"):
+                from services.refinement import maybe_refine
+                refined = await asyncio.to_thread(maybe_refine, result["text"])
+                if refined and refined != result["text"]:
+                    result["refined_text"] = refined
+            if not await _safe_send({"type": "final", **result}):
+                logger.debug("Skipped final send — client already disconnected")
+        except Exception as e:
+            logger.error("Final transcription failed: %s", e)
+            await _safe_send({"type": "error", "detail": str(e)})
+    else:
+        await _safe_send({
+            "type": "final",
+            "text": "",
+            "segments": [],
+            "language": "unknown",
+            "duration_s": 0,
+            "transcription_time_s": 0,
+            "engine": "none",
+        })
+
+    if not client_disconnected:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+async def _transcribe_buffer(chunks: list[bytes], *, pcm_sr: int | None = None) -> str:
+    """Quick partial transcription of the current audio buffer."""
+
+    tmp = _pcm16_to_wav(b"".join(chunks), pcm_sr) if pcm_sr else _chunks_to_wav(chunks)
+    if tmp is None:
+        return ""
+
+    try:
+        from services.model_manager import _gpu_pool
+        from services.asr_backend import get_capture_asr_backend
+
+        def _run():
+            backend = get_capture_asr_backend()
+            result = backend.transcribe(tmp, word_timestamps=False)
+            return result.get("text", "")
+
+        loop = asyncio.get_running_loop()
+        text = await loop.run_in_executor(_gpu_pool, _run)
+        return text.strip()
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+async def _transcribe_buffer_full(chunks: list[bytes], *, pcm_sr: int | None = None) -> dict:
+    """Full transcription with timing info for the final result."""
+    tmp = _pcm16_to_wav(b"".join(chunks), pcm_sr) if pcm_sr else _chunks_to_wav(chunks)
+    if tmp is None:
+        return {"text": "", "segments": [], "language": "unknown",
+                "duration_s": 0, "transcription_time_s": 0, "engine": "none"}
+
+    try:
+        from services.model_manager import _gpu_pool
+        from services.asr_backend import get_capture_asr_backend
+
+        def _run():
+            backend = get_capture_asr_backend()
+            t0 = time.perf_counter()
+            result = backend.transcribe(tmp, word_timestamps=False)
+            elapsed = round(time.perf_counter() - t0, 2)
+
+            segments = result.get("segments", [])
+            full_text = result.get("text", "")
+            if not full_text and segments:
+                full_text = " ".join(s.get("text", "") for s in segments).strip()
+
+            # Wave 1.1: strip Whisper hallucination loops from the final
+            # text (the string that gets auto-pasted). Segments keep the
+            # raw recognition so their timings stay truthful.
+            from services.refinement import collapse_repetitive_artifacts
+            full_text = collapse_repetitive_artifacts(full_text)
+
+            duration = max((s.get("end", 0) for s in segments), default=0.0)
+
+            return {
+                "text": full_text,
+                "segments": [
+                    {"start": round(s.get("start", 0), 2),
+                     "end": round(s.get("end", 0), 2),
+                     "text": s.get("text", "").strip()}
+                    for s in segments
+                ],
+                "language": result.get("language", "unknown"),
+                "duration_s": round(duration, 2),
+                "transcription_time_s": elapsed,
+                "engine": backend.id,
+            }
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_gpu_pool, _run)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _chunks_to_wav(chunks: list[bytes]) -> str | None:
+    """Concatenate audio chunks and write to a temp WAV file.
+
+    Handles both raw PCM (from AudioWorklet) and WebM/Opus blobs
+    (from MediaRecorder) by converting through ffmpeg.
+
+    Falls back to saving raw WebM if ffmpeg conversion fails — the ASR
+    backends (MLX Whisper, WhisperX) can decode WebM/Opus natively.
+    """
+    if not chunks:
+        return None
+
+    blob = b"".join(chunks)
+    if len(blob) < 100:
+        return None
+
+    # Write blob to temp file
+    tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix=".webm")
+    tmp_in.write(blob)
+    tmp_in.close()
+
+    tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    tmp_out.close()
+
+    try:
+        from services.ffmpeg_utils import find_ffmpeg
+        import subprocess
+        subprocess.run(
+            [find_ffmpeg(), "-y", "-i", tmp_in.name,
+             "-ar", "16000", "-ac", "1", "-f", "wav", tmp_out.name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=True,
+        )
+        # ffmpeg succeeded — clean up input, return WAV
+        try:
+            os.unlink(tmp_in.name)
+        except OSError:
+            pass
+        return tmp_out.name
+    except Exception as e:
+        logger.debug("ffmpeg conversion failed: %s", e)
+        try:
+            os.unlink(tmp_out.name)
+        except OSError:
+            pass
+        # Fallback: return the raw WebM — ASR backends (MLX Whisper,
+        # WhisperX) can decode WebM/Opus containers natively.
+        logger.debug("Falling back to raw WebM input for ASR")
+        return tmp_in.name
+
