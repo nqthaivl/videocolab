@@ -59,6 +59,49 @@ import torchaudio
 
 logger = logging.getLogger("omnivoice.audio_io")
 
+# Minimum samples for silence placeholders. ``_safe_torchaudio_save`` rejects
+# ``numel() == 0`` (issue #48); int(duration * sr) can round to 0 on tiny slots.
+_MIN_SILENCE_SAMPLES = 1
+
+
+def duration_to_samples(duration_s: float, sample_rate: int, *, min_samples: int = _MIN_SILENCE_SAMPLES) -> int:
+    """Convert seconds to a sample count, never returning zero."""
+    return max(min_samples, int(max(0.0, duration_s) * sample_rate))
+
+
+def silence_tensor(
+    duration_s: float,
+    sample_rate: int,
+    *,
+    min_samples: int = _MIN_SILENCE_SAMPLES,
+) -> torch.Tensor:
+    """Return a mono silence buffer of at least ``min_samples`` samples."""
+    return torch.zeros(1, duration_to_samples(duration_s, sample_rate, min_samples=min_samples))
+
+
+def coerce_non_empty_audio(
+    tensor: torch.Tensor,
+    sample_rate: int,
+    *,
+    duration_s: float = 0.05,
+) -> torch.Tensor:
+    """Return ``tensor`` when it has samples; otherwise a short silence pad."""
+    if torch.is_tensor(tensor) and tensor.numel() > 0:
+        return tensor
+    return silence_tensor(duration_s, sample_rate)
+
+
+def resolve_timeline_duration(
+    job_duration: float,
+    segment_ends: list[float] | None = None,
+    *,
+    min_duration: float = 0.001,
+) -> float:
+    """Job duration for mix/export ΓÇö infer from cue ends when the job has none."""
+    cue_end = max(segment_ends or [0.0], default=0.0)
+    return max(float(job_duration or 0.0), cue_end, min_duration)
+
+
 # A WAV destination is either a filesystem path or a binary stream
 # (``io.BytesIO`` for in-memory responses). ``torchaudio.save`` accepts
 # both; we forward whichever the caller hands us.

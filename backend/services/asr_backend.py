@@ -1037,7 +1037,7 @@ class MoonshineASRBackend(ASRBackend):
 
 # SenseVoice emits rich tokens like `<|en|><|NEUTRAL|><|Speech|>` around the
 # text; strip them when no postprocessor is applied.
-_FUNASR_TAG_RE = re.compile(r"<\|[^|>]*\|>")
+_FUNASR_TAG_RE = re.compile(r"<\|([^|>]*)\|>")
 
 
 def _ms_to_s(value):
@@ -1052,6 +1052,18 @@ def _clean_funasr_text(text):
     return _FUNASR_TAG_RE.sub("", str(text or "")).strip()
 
 
+def _postprocess_funasr_text(text):
+    """Strip SenseVoice tags and apply FunASR rich postprocess when available."""
+    cleaned = _clean_funasr_text(text)
+    if not cleaned:
+        return ""
+    try:
+        from funasr.utils.postprocess_utils import rich_transcription_postprocess
+        return rich_transcription_postprocess(cleaned).strip()
+    except Exception:
+        return cleaned
+
+
 def _normalize_funasr(res) -> dict:
     """Normalise FunASR ``generate()`` output → OmniVoice's
     ``{chunks, segments, language}`` shape (the same one the Whisper backends
@@ -1064,22 +1076,31 @@ def _normalize_funasr(res) -> dict:
     if not isinstance(item, dict):
         item = {"text": str(item)}
     language = item.get("language") or item.get("lang") or None
+    if not language:
+        tag_match = _FUNASR_TAG_RE.search(str(item.get("text") or ""))
+        if tag_match:
+            tag = tag_match.group(1).lower()
+            if tag in ("zh", "en", "ja", "ko", "yue", "auto"):
+                language = "zh" if tag == "yue" else tag
 
     segments = []
     for s in item.get("sentence_info") or []:
         if not isinstance(s, dict):
             continue
-        txt = _clean_funasr_text(s.get("text", ""))
+        # SenseVoice returns ``sentence``; other FunASR models may use ``text``.
+        txt = _postprocess_funasr_text(s.get("sentence") or s.get("text") or "")
         if not txt:
             continue
-        seg = {"text": txt, "start": _ms_to_s(s.get("start", 0)) or 0.0, "end": _ms_to_s(s.get("end"))}
+        start = _ms_to_s(s.get("start", 0)) or 0.0
+        end = _ms_to_s(s.get("end"))
+        seg = {"text": txt, "start": start, "end": end}
         spk = s.get("spk")
         if spk is not None:
             seg["speaker"] = f"Speaker {int(spk) + 1}" if isinstance(spk, (int, float)) else str(spk)
         segments.append(seg)
 
     if not segments:
-        txt = _clean_funasr_text(item.get("text", ""))
+        txt = _postprocess_funasr_text(item.get("text", ""))
         if txt:
             ts = item.get("timestamp") or []  # [[start_ms, end_ms], ...]
             start = _ms_to_s(ts[0][0]) if ts else 0.0
@@ -1120,17 +1141,39 @@ class FunASRBackend(ASRBackend):
         if self._model is not None:
             return
         from funasr import AutoModel
-        kwargs = {"model": self._model_name, "vad_model": self._vad_model, "disable_update": True}
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except ImportError:
+            device = "cpu"
+        kwargs = {
+            "model": self._model_name,
+            "vad_model": self._vad_model,
+            "disable_update": True,
+            "device": device,
+        }
         if self._spk_model:
             kwargs["spk_model"] = self._spk_model
-        logger.info("FunASR loading %s (vad=%s, spk=%s)", self._model_name, self._vad_model, self._spk_model or "off")
+        logger.info(
+            "FunASR loading %s (vad=%s, spk=%s, device=%s)",
+            self._model_name, self._vad_model, self._spk_model or "off", device,
+        )
         self._model = AutoModel(**kwargs)
 
     def transcribe(self, audio_path: str, *, word_timestamps: bool = True, language: str | None = None) -> dict:
         self._ensure_model()
         logger.info("FunASR transcribing %s (language=%s)", audio_path, language)
         lang = language or "auto"
-        res = self._model.generate(input=audio_path, cache={}, language=lang, use_itn=True)
+        batch_size_s = int(os.environ.get("ASR_FUNASR_BATCH_SIZE_S", "300"))
+        max_end_silence = int(os.environ.get("ASR_FUNASR_MAX_END_SILENCE_MS", "500"))
+        res = self._model.generate(
+            input=audio_path,
+            cache={},
+            language=lang,
+            use_itn=True,
+            batch_size_s=batch_size_s,
+            max_end_silence_time=max_end_silence,
+        )
         return _normalize_funasr(res)
 
     def unload(self) -> None:

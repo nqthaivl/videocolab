@@ -117,6 +117,43 @@ REGISTRY: dict[str, dict] = {
             "Set TRANSLATE_BASE_URL + TRANSLATE_API_KEY + TRANSLATE_MODEL."
         ),
     },
+    "gemini": {
+        "id": "gemini",
+        "display_name": "Google Gemini (Online, Key)",
+        "pip_package": "openai",
+        "probe_module": "openai",
+        "category": "llm",
+        "needs_key": True,
+        "notes": (
+            "Google Gemini via OpenAI-compatible endpoint. "
+            "Set GEMINI_TRANSLATE_API_KEY in Settings → API dịch cloud."
+        ),
+    },
+    "deepseek": {
+        "id": "deepseek",
+        "display_name": "DeepSeek (Online, Key)",
+        "pip_package": "openai",
+        "probe_module": "openai",
+        "category": "llm",
+        "needs_key": True,
+        "notes": (
+            "DeepSeek via OpenAI-compatible API (https://api.deepseek.com/v1). "
+            "Set DEEPSEEK_TRANSLATE_API_KEY in Settings → API dịch cloud."
+        ),
+    },
+    "9router": {
+        "id": "9router",
+        "display_name": "9Router (Local proxy, Key)",
+        "pip_package": "openai",
+        "probe_module": "openai",
+        "category": "llm",
+        "needs_key": True,
+        "notes": (
+            "Local 9Router proxy (default http://localhost:20128/v1). "
+            "Routes to 40+ providers (Claude, Gemini, OpenAI, …). "
+            "Set NINEROUTER_TRANSLATE_API_KEY in Settings → API dịch cloud."
+        ),
+    },
     "llama_cpp": {
         "id": "llama_cpp",
         "display_name": "llama.cpp (local LLM)",

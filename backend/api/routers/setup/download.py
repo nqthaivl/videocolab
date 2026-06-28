@@ -440,9 +440,9 @@ async def install_model(req: InstallModelRequest):
                     hf_progress.emit({
                         "repo_id": req.repo_id,
                         "filename": req.repo_id,
-                        "downloaded": 0, "total": 0, "pct": 0.0,
                         "phase": "resolving",
                         "step": _step,
+                        "overall_pct": min(0.05, _step * 0.008),
                     })
 
             hb = threading.Thread(target=_heartbeat, daemon=True)

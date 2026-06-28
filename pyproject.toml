@@ -138,6 +138,7 @@ dependencies = [
     # openai` hint landed in the wrong interpreter on a managed venv.
     "openai>=1.40",
     "deep-translator>=1.11.4",
+    "funasr>=1.2.0",
 ]
 
 [project.optional-dependencies]
@@ -146,7 +147,6 @@ eval = [
     "jiwer==3.1.0",       # WER
     "librosa",             # Audio processing
     "s3prl",               # Speech representation (HuBERT etc.)
-    "funasr",              # ASR models
     "zhconv",              # Chinese character normalization
     "zhon",                # Chinese punctuation
     "unidecode",            # Unicode normalization

@@ -160,6 +160,21 @@ def _words_from_whisper(result: dict) -> List[Word]:
         if words:
             return words
 
+        # Segment-level timings (FunASR sentence_info, etc.) — one token per VAD segment
+        # so downstream grouping preserves natural speech boundaries.
+        for seg in segs:
+            txt = _clean((seg.get("text") or "").strip())
+            if not txt:
+                continue
+            s = float(seg.get("start", 0.0))
+            e_raw = seg.get("end")
+            e = float(e_raw if e_raw is not None else s + 0.1)
+            if e <= s:
+                e = s + 0.1
+            words.append(Word(start=s, end=e, text=txt))
+        if words:
+            return words
+
     # Fallback: chunk-level timings (no per-word granularity)
     for chunk in result.get("chunks", []) or []:
         ts = chunk.get("timestamp") or (0.0, 0.0)
@@ -470,12 +485,45 @@ def _apply_scene_cuts(segments: List[Segment], scene_cuts: Iterable[float]) -> L
     return out
 
 
+def _segments_from_asr_timings(whisper_result: dict) -> Optional[List[Segment]]:
+    """Use pre-segmented ASR output (FunASR sentence_info, etc.) when no word timings."""
+    segs_in = (whisper_result or {}).get("segments") or []
+    if not segs_in:
+        return None
+    if any((s.get("words") or []) for s in segs_in if isinstance(s, dict)):
+        return None
+    segments: List[Segment] = []
+    for s in segs_in:
+        if not isinstance(s, dict):
+            continue
+        txt = _clean(s.get("text", ""))
+        if not txt or s.get("start") is None:
+            continue
+        start = float(s.get("start", 0.0))
+        end_raw = s.get("end")
+        end = float(end_raw if end_raw is not None else start + 0.1)
+        if end <= start:
+            end = start + 0.1
+        segments.append(Segment(start=start, end=end, text=txt))
+    return segments or None
+
+
 def segment_transcript(
     whisper_result: dict,
     duration: float,
     scene_cuts: Optional[Iterable[float]] = None,
 ) -> List[dict]:
     """Public entry point: whisper result → clean dub segments (as dicts)."""
+    asr_segments = _segments_from_asr_timings(whisper_result)
+    if asr_segments:
+        segments = _merge_short(asr_segments)
+        if scene_cuts:
+            segments = _apply_scene_cuts(segments, scene_cuts)
+            segments = _merge_short(segments)
+        segments = _stitch_adjacent_shorts(segments)
+        segments = _merge_short(segments)
+        return [s.to_dict() for s in segments]
+
     words = _words_from_whisper(whisper_result)
     if not words:
         text = _clean((whisper_result or {}).get("text", ""))

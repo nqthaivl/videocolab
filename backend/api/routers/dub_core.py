@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import asyncio
 import logging
@@ -7,7 +8,7 @@ import subprocess
 import soundfile as sf
 import torch
 from typing import Optional
-from fastapi import APIRouter, File, Form, UploadFile, HTTPException, Body
+from fastapi import APIRouter, File, Form, UploadFile, HTTPException, Body, Query
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 
 from core.db import db_conn
@@ -25,7 +26,7 @@ from services.segmentation import (
     assign_speakers_heuristic,
     clean_up_segments,
 )
-from services.onset_align import snap_segment_starts
+from services.onset_align import snap_segment_starts, split_segments_at_silence, needs_silence_resplit
 from services import dub_pipeline
 
 router = APIRouter()
@@ -159,10 +160,23 @@ async def dub_import_srt(job_id: str, file: UploadFile = File(...)):
     else:
         segments = result.segments
 
+    # SRT-only jobs are created with duration=0. Downstream mix/export needs a
+    # non-zero timeline or the final dubbed WAV is empty (#48 guard).
+    cue_end = max((float(s["end"]) for s in segments), default=0.0)
+    if cue_end > 0:
+        job["duration"] = max(duration, cue_end)
+
     job["segments"] = segments
-    # `source_lang` stays whatever the user (or the upload step) set; we
-    # don't try to language-detect off the cue text — that's noisy and the
-    # user usually knows what their .srt is.
+    if not job.get("source_lang") or job.get("source_lang") in ("en", "auto"):
+        from api.routers.dub_translate import _guess_lang_from_text
+
+        class _Cue:
+            def __init__(self, text: str):
+                self.text = text
+
+        guessed = _guess_lang_from_text([_Cue(s["text"]) for s in segments[:12]])
+        if guessed:
+            job["source_lang"] = guessed
     _save_job(job_id, job)
     logger.info(
         "Imported %d cue(s) from .srt for job %s (skipped=%d, overlap_shifted=%d, clamped=%d)",
@@ -177,6 +191,67 @@ async def dub_import_srt(job_id: str, file: UploadFile = File(...)):
             "clamped_to_duration": clamped,
         },
     }
+
+
+@router.post("/dub/detect-text/{job_id}")
+async def detect_video_text_regions(
+    job_id: str,
+    max_frames: int = Query(16, ge=4, le=80, description="Max frames to analyze"),
+    sample_fps: float = Query(0.5, ge=0.1, le=2.0, description="Frames per second to sample"),
+):
+    """OCR-style detection of on-screen text regions for blur overlay."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", job_id):
+        raise HTTPException(status_code=400, detail="Invalid job id")
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    video_path = job.get("video_path")
+    if not video_path or not os.path.isfile(video_path):
+        raise HTTPException(status_code=400, detail="Video not found for this job")
+
+    from services.video_text_detect import detect_text_regions
+
+    result = await detect_text_regions(video_path, max_frames=max_frames, sample_fps=sample_fps)
+    if result.get("error") and not result.get("regions"):
+        return result
+    return result
+
+
+@router.post("/dub/extract-ocr-subtitles/{job_id}")
+async def dub_extract_ocr_subtitles(
+    job_id: str,
+    max_frames: int = Query(40, ge=8, le=120, description="Max frames to OCR"),
+    sample_fps: float = Query(1.0, ge=0.2, le=3.0, description="Frames per second to sample"),
+    language: Optional[str] = Query(None, description="Source language hint (auto/vi/zh/...)"),
+):
+    """Read burned-in on-screen subtitles via OCR → dub segments (skip ASR)."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", job_id):
+        raise HTTPException(status_code=400, detail="Invalid job id")
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    video_path = job.get("video_path")
+    if not video_path or not os.path.isfile(video_path):
+        raise HTTPException(status_code=400, detail="Video not found for this job")
+
+    from services.video_text_detect import extract_ocr_subtitle_segments
+    from services.hunyuan_ocr import is_hunyuan_model_cached, is_hunyuan_model_loaded
+
+    result = await extract_ocr_subtitle_segments(
+        video_path,
+        max_frames=max_frames,
+        sample_fps=sample_fps,
+        language=language,
+    )
+    result["model_cached"] = is_hunyuan_model_cached()
+    result["model_loaded"] = is_hunyuan_model_loaded()
+    segments = result.get("segments") or []
+    if segments:
+        job["segments"] = segments
+        if segments:
+            job["duration"] = max(float(job.get("duration") or 0), float(segments[-1]["end"]))
+        _save_job(job_id, job)
+    return result
 
 
 @router.post("/dub/cleanup-segments/{job_id}")
@@ -310,12 +385,16 @@ async def dub_upload(
     job_id: Optional[str] = Form(None),
     input_type: str = Form("video"),
     skip_demucs: bool = Form(False),
+    srt_mode: bool = Form(False),
 ):
     """Accept a media upload, write to disk, queue background prep task.
 
     `input_type` is "video" (default) or "audio". Audio-only jobs (#119) skip
     scene detection, thumbnailing, and the final video mux — the transcribe →
     translate → TTS core is identical.
+
+    `srt_mode=true` (Clone phim + file SRT): skip Demucs + scene detection —
+    only extract audio/video for mux; subtitles come from the uploaded SRT.
 
     Returns 202 with {job_id, task_id, filename}. Client should open SSE on
     /tasks/stream/{task_id} to monitor extract/demucs stages and wait for the
@@ -324,6 +403,9 @@ async def dub_upload(
     input_type = (input_type or "video").lower()
     if input_type not in ("video", "audio"):
         raise HTTPException(status_code=400, detail="input_type must be 'video' or 'audio'")
+
+    if srt_mode:
+        skip_demucs = True
 
     job_id = job_id or str(uuid.uuid4())[:8]
     job_dir = _safe_job_dir(job_id)
@@ -350,7 +432,7 @@ async def dub_upload(
     await task_manager.add_task(
         task_id, "prep",
         _ingest_gen, job_id, job_dir,
-        {"kind": "file", "path": video_path, "input_type": input_type, "skip_demucs": skip_demucs}, filename,
+        {"kind": "file", "path": video_path, "input_type": input_type, "skip_demucs": skip_demucs, "srt_mode": srt_mode}, filename,
     )
     return JSONResponse(
         status_code=202,
@@ -511,8 +593,28 @@ async def dub_transcribe_stream(
             return
 
         total = float(len(audio_np)) / float(sr) if sr else 0.0
-        chunks_n = max(1, int(math.ceil(total / TRANSCRIBE_CHUNK_S))) if total > 0 else 1
-        yield _sse_event("start", {"duration": total, "chunks": chunks_n, "chunk_s": TRANSCRIBE_CHUNK_S})
+        # FunASR: built-in VAD + sentence_info. Whole-file mode is most accurate
+        # but blocks the SSE stream until the full clip finishes. For long
+        # videos, chunk at ASR_FUNASR_CHUNK_S (default 90s when duration > 3min)
+        # so segments appear progressively without the old 30s Whisper boundaries.
+        funasr_chunk_s = 0.0
+        if _asr_backend.id == "funasr":
+            raw_chunk = os.environ.get("ASR_FUNASR_CHUNK_S", "").strip()
+            if raw_chunk:
+                funasr_chunk_s = max(0.0, float(raw_chunk))
+            elif total > 180.0:
+                funasr_chunk_s = 90.0
+        use_funasr_whole_file = _asr_backend.id == "funasr" and funasr_chunk_s <= 0
+        if _asr_backend.id == "funasr" and funasr_chunk_s > 0:
+            chunks_n = max(1, int(math.ceil(total / funasr_chunk_s))) if total > 0 else 1
+            chunk_s = funasr_chunk_s
+        elif use_funasr_whole_file:
+            chunks_n = 1
+            chunk_s = total if total > 0 else TRANSCRIBE_CHUNK_S
+        else:
+            chunks_n = max(1, int(math.ceil(total / TRANSCRIBE_CHUNK_S))) if total > 0 else 1
+            chunk_s = TRANSCRIBE_CHUNK_S
+        yield _sse_event("start", {"duration": total, "chunks": chunks_n, "chunk_s": chunk_s})
 
         # Free VRAM: move TTS model to CPU so WhisperX + VAD can fit.
         # Only offloads when free GPU memory is < 4 GB (e.g. laptop GPUs).
@@ -525,6 +627,7 @@ async def dub_transcribe_stream(
 
         all_segments: list[dict] = []
         detected_lang = None
+        lang_for_asr = language  # reuse after first auto-detect to skip re-detect per chunk
         next_seg_id = 0
         chunk_errors: list[str] = []
         # Speaker turns from an ASR backend that diarizes inline (FunASR cam++).
@@ -535,26 +638,38 @@ async def dub_transcribe_stream(
             if job.get("aborted"):
                 yield _sse_event("aborted", {})
                 return
-            t0 = i * TRANSCRIBE_CHUNK_S
-            t1 = min(total, t0 + TRANSCRIBE_CHUNK_S)
-            s_from = int(t0 * sr)
-            s_to = int(t1 * sr)
-            chunk_arr = audio_np[s_from:s_to]
-            if len(chunk_arr) == 0:
-                continue
+            if use_funasr_whole_file:
+                t0, t1 = 0.0, total
+                chunk_arr = None
+            else:
+                t0 = i * chunk_s
+                t1 = min(total, t0 + chunk_s)
+                s_from = int(t0 * sr)
+                s_to = int(t1 * sr)
+                chunk_arr = audio_np[s_from:s_to]
+                if len(chunk_arr) == 0:
+                    continue
 
-            def _transcribe_chunk(arr=chunk_arr, offset=t0, local_sr=sr):
+            def _transcribe_chunk(arr=chunk_arr, offset=t0, local_sr=sr, whole_file=use_funasr_whole_file, lang=lang_for_asr):
                 # Route through the active backend (WhisperX by default).
-                # Backends all take a file path, so write the chunk first.
+                # Backends all take a file path — write chunk wav unless FunASR
+                # whole-file mode (VAD needs full context).
                 try:
-                    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-                    tmp.close()
+                    if whole_file:
+                        audio_path = asr_audio_target
+                    else:
+                        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                        tmp.close()
+                        audio_path = tmp.name
+                        _safe_soundfile_write(audio_path, arr, local_sr)
                     try:
-                        _safe_soundfile_write(tmp.name, arr, local_sr)
-                        r = _asr_backend.transcribe(tmp.name, word_timestamps=True, language=language)
+                        r = _asr_backend.transcribe(audio_path, word_timestamps=True, language=lang)
                     finally:
-                        try: os.remove(tmp.name)
-                        except OSError: pass
+                        if not whole_file:
+                            try:
+                                os.remove(audio_path)
+                            except OSError:
+                                pass
                     shifted = []
                     for c in r.get("chunks", []) or []:
                         ts = c.get("timestamp", (0.0, 0.0)) or (0.0, 0.0)
@@ -614,6 +729,11 @@ async def dub_transcribe_stream(
                 fut = loop.run_in_executor(_gpu_pool, _transcribe_chunk)
                 waited = 0.0
                 part = None
+                chunk_timeout = (
+                    max(TRANSCRIBE_CHUNK_TIMEOUT_S, total * 3.0)
+                    if use_funasr_whole_file
+                    else TRANSCRIBE_CHUNK_TIMEOUT_S
+                )
                 while True:
                     done, pending = await asyncio.wait([fut], timeout=5.0)
                     if done:
@@ -621,17 +741,17 @@ async def dub_transcribe_stream(
                         break
                     yield _sse_event("ping", {})
                     waited += 5.0
-                    if waited >= TRANSCRIBE_CHUNK_TIMEOUT_S:
+                    if waited >= chunk_timeout:
                         # Re-raise TimeoutError if we exceed the overall limit
                         raise asyncio.TimeoutError()
             except asyncio.TimeoutError:
                 logger.error(
                     "Transcribe chunk %d/%d timed out after %.0fs (job=%s)",
-                    i + 1, chunks_n, TRANSCRIBE_CHUNK_TIMEOUT_S, job_id,
+                    i + 1, chunks_n, chunk_timeout, job_id,
                 )
                 part = {
                     "chunks": [], "language": None,
-                    "error": f"Chunk {i+1} timed out after {TRANSCRIBE_CHUNK_TIMEOUT_S:.0f}s — "
+                    "error": f"Chunk {i+1} timed out after {chunk_timeout:.0f}s — "
                              f"ASR backend may be stuck. Try restarting the server.",
                 }
             if part.get("error"):
@@ -639,6 +759,7 @@ async def dub_transcribe_stream(
                 logger.warning("Chunk %d/%d error: %s", i + 1, chunks_n, part["error"])
             if detected_lang is None and part.get("language"):
                 detected_lang = part["language"]
+                lang_for_asr = (detected_lang.split("_")[0][:2] or detected_lang).lower()
             asr_speaker_turns.extend(part.get("speaker_turns") or [])
             chunk_segs = segment_transcript(part, duration=t1, scene_cuts=scene_cuts)
             # #280: Whisper often stretches a segment's start back over
@@ -650,6 +771,11 @@ async def dub_transcribe_stream(
                 snap_segment_starts(chunk_segs, audio_np, sr)
             except Exception as e:
                 logger.warning("onset alignment skipped for chunk %d: %s", i, e)
+            if needs_silence_resplit(chunk_segs):
+                try:
+                    chunk_segs = split_segments_at_silence(chunk_segs, audio_np, sr)
+                except Exception as e:
+                    logger.warning("silence split skipped for chunk %d: %s", i, e)
             chunk_segs = assign_speakers_heuristic(chunk_segs)
             for s in chunk_segs:
                 s["id"] = f"s{next_seg_id:05x}"
@@ -1033,6 +1159,8 @@ async def dub_transcribe(job_id: str):
         try:
             audio_for_onset, onset_sr = sf.read(asr_audio_target, dtype="float32")
             snap_segment_starts(segments, audio_for_onset, onset_sr)
+            if needs_silence_resplit(segments):
+                segments = split_segments_at_silence(segments, audio_for_onset, onset_sr)
         except Exception as e:
             logger.warning("onset alignment skipped: %s", e)
 

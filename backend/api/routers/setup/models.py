@@ -112,6 +112,34 @@ def gguf_installed(hf_repo_id: str, gguf_pattern: str) -> bool:
     return False
 
 
+def catalog_by_llama_model(llama_model: str) -> dict | None:
+    """Return a catalog entry whose ``llama_model`` field matches."""
+    for model in KNOWN_MODELS:
+        if model.get("llama_model") == llama_model:
+            return model
+    return None
+
+
+def resolve_gguf_path(hf_repo_id: str, gguf_pattern: str) -> str | None:
+    """Return the absolute path to an installed GGUF quant, if present."""
+    repo_name = _repo_dir_name(hf_repo_id)
+    for root in _hub_cache_roots():
+        snapshots = os.path.join(root, repo_name, "snapshots")
+        if not os.path.isdir(snapshots):
+            continue
+        try:
+            for revision in os.listdir(snapshots):
+                revision_dir = os.path.join(snapshots, revision)
+                if not os.path.isdir(revision_dir):
+                    continue
+                found = _find_gguf_in_dir(revision_dir, gguf_pattern)
+                if found:
+                    return found[0]
+        except OSError:
+            continue
+    return None
+
+
 def gguf_size_on_disk(hf_repo_id: str, gguf_pattern: str) -> int:
     """Best-effort size of an installed GGUF quant."""
     repo_name = _repo_dir_name(hf_repo_id)
@@ -302,6 +330,24 @@ def _repo_has_complete_weights(repo_id: str) -> bool:
             continue
     return False
 
+
+def _repo_size_on_disk(repo_id: str) -> int:
+    """Total bytes for a repo across all known HF cache roots."""
+    repo_name = _repo_dir_name(repo_id)
+    total = 0
+    for root in _hub_cache_roots():
+        repo_root = os.path.join(root, repo_name)
+        if not os.path.isdir(repo_root):
+            continue
+        for dirpath, _dirs, files in os.walk(repo_root):
+            for filename in files:
+                try:
+                    total += os.path.getsize(os.path.join(dirpath, filename))
+                except OSError:
+                    continue
+    return total
+
+
 def _hub_cache_roots() -> list[str]:
     """Candidate roots that directly contain ``models--*`` dirs.
 
@@ -317,6 +363,10 @@ def _hub_cache_roots() -> list[str]:
     hub = os.path.join(base, "hub")
     if hub not in roots:
         roots.append(hub)
+    # Manual / first-run downloads may land in the default HF hub cache.
+    default_hub = os.path.join(os.path.expanduser("~/.cache/huggingface"), "hub")
+    if os.path.isdir(default_hub) and default_hub not in roots:
+        roots.append(default_hub)
     return roots
 
 
@@ -467,16 +517,18 @@ def list_models():
             size_on_disk = gguf_size_on_disk(hf_repo, gguf_pattern)
             nb_files = 1 if installed else 0
         else:
-            installed = (
-                cached is not None
-                and cached["size_on_disk"] > 0
-                and _repo_has_complete_weights(hf_repo)
-            )
+            installed = _repo_has_complete_weights(hf_repo)
             size_on_disk = cached["size_on_disk"] if cached else 0
-            nb_files = cached["nb_files"] if cached else 0
+            if size_on_disk <= 0:
+                size_on_disk = _repo_size_on_disk(hf_repo)
+            if installed and size_on_disk <= 0:
+                size_on_disk = _repo_size_on_disk(hf_repo)
+            nb_files = cached["nb_files"] if cached else (1 if installed else 0)
+        partial = (not installed) and size_on_disk > 1024 * 1024 and size_on_disk < int(m.get("size_gb", 1) * 0.5 * 1024**3)
         out.append({
             **m,
             "installed": installed,
+            "partial": partial,
             "size_on_disk_bytes": size_on_disk,
             "nb_files": nb_files,
             "supported": _model_supported(m),
@@ -543,10 +595,11 @@ def recommendations():
         ]
         if has_cuda:
             recommended_ids.append("openai/whisper-large-v3")
+            recommended_ids.append("tencent/HunyuanOCR")
             rationale = (
                 "Cross-platform stack + pytorch-whisper as a CUDA-accelerated "
-                "ASR fallback. MLX / mlx-audio are Apple-Silicon-only and don't "
-                "apply here."
+                "ASR fallback + HunyuanOCR for hard-subtitle extraction on Douyin videos. "
+                "MLX / mlx-audio are Apple-Silicon-only and don't apply here."
             )
         else:
             rationale = (

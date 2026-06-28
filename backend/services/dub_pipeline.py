@@ -790,17 +790,20 @@ async def ingest_pipeline(
             yield prep_event("extract_done", job_id=job_id, duration=round(dur, 2), filename=filename)
 
             skip_demucs = bool(source.get("skip_demucs", False))
+            srt_mode = bool(source.get("srt_mode", False))
+            skip_scene = srt_mode or bool(source.get("skip_scene", False))
             vocals_path = os.path.join(job_dir, "vocals.wav")
             no_vocals_path = os.path.join(job_dir, "no_vocals.wav")
             scene_cuts: list = []
 
-            yield prep_event("demucs_start")
-            try:
-                if skip_demucs:
-                    logger.info("Skipping Demucs separation for job %s", job_id)
-                    shutil.copy2(audio_path, vocals_path)
-                    no_vocals_path = None
-                else:
+            if skip_demucs:
+                logger.info("Skipping Demucs for job %s (srt_mode=%s)", job_id, srt_mode)
+                shutil.copy2(audio_path, vocals_path)
+                no_vocals_path = None
+                yield prep_event("demucs_done", has_bg=False, skipped=True)
+            else:
+                yield prep_event("demucs_start")
+                try:
                     demucs_cmd = [sys.executable, "-m", "demucs.separate",
                                   "--two-stems", "vocals", "-n", "htdemucs", "-d", get_best_device(),
                                   audio_path, "-o", job_dir]
@@ -811,45 +814,59 @@ async def ingest_pipeline(
                 # "  42%|████      | …" — surface each new integer percent
                 # to the UI so the user sees the bar instead of a static
                 # spinner during the multi-minute separation step.
-                async for evt in run_proc_streaming_stderr(job_id, demucs_cmd, timeout=1800.0):
-                    if evt[0] == "stderr":
-                        m = re.search(r"(\d{1,3})%", evt[1])
-                        if m:
-                            pct = max(0, min(100, int(m.group(1))))
-                            if pct != last_pct:
-                                last_pct = pct
-                                yield prep_event("demucs_progress", percent=pct)
-                    elif evt[0] == "done":
-                        rc, stderr_full = evt[1], evt[2]
-                if rc != 0:
-                    raise Exception(stderr_full.decode(errors="replace")[:500])
-                demucs_out = os.path.join(job_dir, "htdemucs", "audio")
-                if os.path.exists(os.path.join(demucs_out, "vocals.wav")):
-                    shutil.move(os.path.join(demucs_out, "vocals.wav"), vocals_path)
-                    shutil.move(os.path.join(demucs_out, "no_vocals.wav"), no_vocals_path)
-                    shutil.rmtree(os.path.join(job_dir, "htdemucs"), ignore_errors=True)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.warning("Demucs failed for %s, falling back to mixed audio: %s", job_id, e)
-                # plan-04: surface the degradation (job continues with mixed audio).
-                yield prep_event("warning", **failure.build_failure(e, stage="demucs", include_diagnostic=False))
-                vocals_path = audio_path
-                no_vocals_path = None
-            yield prep_event("demucs_done",
-                             has_bg=bool(no_vocals_path and os.path.exists(no_vocals_path)))
+                    async for evt in run_proc_streaming_stderr(job_id, demucs_cmd, timeout=1800.0):
+                        if evt[0] == "stderr":
+                            m = re.search(r"(\d{1,3})%", evt[1])
+                            if m:
+                                pct = max(0, min(100, int(m.group(1))))
+                                if pct != last_pct:
+                                    last_pct = pct
+                                    yield prep_event("demucs_progress", percent=pct)
+                        elif evt[0] == "done":
+                            rc, stderr_full = evt[1], evt[2]
+                    if rc != 0:
+                        raise Exception(stderr_full.decode(errors="replace")[:500])
+                    demucs_out = os.path.join(job_dir, "htdemucs", "audio")
+                    if os.path.exists(os.path.join(demucs_out, "vocals.wav")):
+                        shutil.move(os.path.join(demucs_out, "vocals.wav"), vocals_path)
+                        shutil.move(os.path.join(demucs_out, "no_vocals.wav"), no_vocals_path)
+                        shutil.rmtree(os.path.join(job_dir, "htdemucs"), ignore_errors=True)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning("Demucs failed for %s, falling back to mixed audio: %s", job_id, e)
+                    # plan-04: surface the degradation (job continues with mixed audio).
+                    yield prep_event("warning", **failure.build_failure(e, stage="demucs", include_diagnostic=False))
+                    vocals_path = audio_path
+                    no_vocals_path = None
+                yield prep_event("demucs_done",
+                                 has_bg=bool(no_vocals_path and os.path.exists(no_vocals_path)))
 
             # Audio-only jobs (#119) have no video to scan or thumbnail. Skip
             # both ffmpeg passes but still emit scene_done (count=0) so the
             # prep SSE contract the frontend waits on is unchanged.
             thumb_path = os.path.join(job_dir, "thumb.jpg")
-            if input_type == "audio":
-                # No scenes/thumbnail in audio — emit the start/done pair anyway
-                # so the prep SSE stage sequence stays symmetric with the video
-                # path (the frontend's stage tracker expects both).
-                yield prep_event("scene_start")
-                yield prep_event("scene_done", count=0)
-                thumb_path = None
+            if input_type == "audio" or skip_scene:
+                if not skip_scene:
+                    yield prep_event("scene_start")
+                yield prep_event("scene_done", count=0, skipped=skip_scene)
+                if input_type != "audio" and not skip_scene:
+                    thumb_path = None
+                elif input_type != "audio":
+                    offset = max(0.5, min(1.5, dur * 0.1)) if dur else 1.0
+                    try:
+                        await run_proc([
+                            ffmpeg, "-y", "-ss", f"{offset:.2f}", "-i", video_path,
+                            "-vframes", "1", "-vf", "scale=320:-2",
+                            "-q:v", "4", thumb_path,
+                        ], timeout=30.0)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.warning("Thumbnail extraction failed for %s: %s", job_id, e)
+                        yield prep_event("warning", **failure.build_failure(e, stage="thumbnail", include_diagnostic=False))
+                else:
+                    thumb_path = None
             else:
                 yield prep_event("scene_start")
                 try:

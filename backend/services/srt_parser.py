@@ -36,6 +36,16 @@ def _ts_to_seconds(h: str, m: str, s: str, ms: str) -> float:
     return int(h) * 3600 + int(m) * 60 + int(s) + int(ms_padded) / 1000.0
 
 
+def _normalize_cue_text(text: str) -> str:
+    """Lowercase cue text for TTS/translation.
+
+    Broadcast and DVD SRTs often ship in ALL CAPS; OmniVoice reads that as
+    shouting. We normalize to lowercase on import while ``text_original``
+    keeps the file's casing.
+    """
+    return text.lower()
+
+
 @dataclass
 class SrtParseResult:
     segments: list[dict]
@@ -111,7 +121,7 @@ def parse_srt(content: str) -> SrtParseResult:
             "id": i,
             "start": round(seg["start"], 3),
             "end": round(seg["end"], 3),
-            "text": seg["text"],
+            "text": _normalize_cue_text(seg["text"]),
             "text_original": seg["text"],
             "speaker_id": "Speaker 1",
         }

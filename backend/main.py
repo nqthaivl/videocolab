@@ -204,6 +204,24 @@ os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "15")
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
 
+# Restore persisted env vars (FFMPEG_PATH, proxy, HF_TOKEN, …) before ffmpeg
+# bootstrap so user Settings override bundled binaries.
+_PERSISTED_ENV_PREFIX = "env."
+try:
+    from core.prefs import _load as _load_all_prefs
+    _prefs = _load_all_prefs()
+    for _k, _v in _prefs.items():
+        if _k.startswith(_PERSISTED_ENV_PREFIX) and _v:
+            _env_key = _k[len(_PERSISTED_ENV_PREFIX):]
+            os.environ.setdefault(_env_key, str(_v))
+except Exception:
+    pass
+
+from services.ffmpeg_utils import bootstrap_ffmpeg_env  # noqa: E402
+_bundled_ffmpeg = bootstrap_ffmpeg_env()
+if _bundled_ffmpeg:
+    import logging as _bootstrap_log
+    _bootstrap_log.getLogger("omnivoice.api").info("Using ffmpeg: %s", _bundled_ffmpeg)
 
 # Prevent torchaudio from lazy-importing torchcodec (broken on some installs).
 # Proper fix = exclude torchcodec in pyproject.toml; this is a belt-and-braces guard.
@@ -215,23 +233,7 @@ import warnings
 import logging
 from logging.handlers import RotatingFileHandler
 
-# ── Restore persisted env vars from prefs.json ────────────────────────────
-# Settings saved via Settings UI (proxy, FFMPEG_PATH, HF_TOKEN, etc.) are
-# written to prefs.json so they survive backend restarts. Read them back
-# here — before any user code reads os.environ — so the values are available
-# from startup.
-_PERSISTED_ENV_PREFIX = "env."
-try:
-    from core.prefs import _load as _load_all_prefs
-    _prefs = _load_all_prefs()
-    for _k, _v in _prefs.items():
-        if _k.startswith(_PERSISTED_ENV_PREFIX) and _v:
-            _env_key = _k[len(_PERSISTED_ENV_PREFIX):]
-            # Do not override an explicitly-set env var (shell > prefs)
-            os.environ.setdefault(_env_key, str(_v))
-except Exception:
-    pass  # prefs.json missing or broken — fine on first run
-
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="pydub.utils")
 warnings.filterwarnings("ignore", category=UserWarning)
 torchaudio.set_audio_backend("soundfile")
 
@@ -410,6 +412,7 @@ from api.routers import (
     audiobook,
     longform_jobs,
     settings as settings_router,  # Phase 1 AUTH-03: HF token save/clear/state
+    video_download,
 )
 from utils import hf_progress
 
@@ -933,7 +936,29 @@ def health():
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = "mps"
 
-    return {"status": "ok", "device": device, "version": APP_VERSION}
+    return {"status": "ok", "device": device, "version": APP_VERSION, "features": {
+        "ocr_detect": True,
+        "ocr_subtitles": True,
+        "ocr_engine": "hunyuan",
+        "hunyuan_ocr_cached": _hunyuan_ocr_cached(),
+        "hunyuan_ocr_loaded": _hunyuan_ocr_loaded(),
+    }}
+
+
+def _hunyuan_ocr_cached() -> bool:
+    try:
+        from services.hunyuan_ocr import is_hunyuan_model_cached
+        return is_hunyuan_model_cached()
+    except Exception:
+        return False
+
+
+def _hunyuan_ocr_loaded() -> bool:
+    try:
+        from services.hunyuan_ocr import is_hunyuan_model_loaded
+        return is_hunyuan_model_loaded()
+    except Exception:
+        return False
 
 
 app.include_router(system.router)
@@ -967,6 +992,7 @@ app.include_router(sonitranslate.router)
 app.include_router(audiobook.router)
 app.include_router(longform_jobs.router)
 app.include_router(settings_router.router)  # Phase 1 AUTH-03 endpoints
+app.include_router(video_download.router)
 from api.routers import mcp_bindings as _mcp_bindings_router  # noqa: E402
 app.include_router(_mcp_bindings_router.router)  # Wave 2.2 per-agent voice bindings
 

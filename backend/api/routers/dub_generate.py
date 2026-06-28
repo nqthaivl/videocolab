@@ -13,7 +13,13 @@ from core.tasks import task_manager
 from schemas.requests import DubRequest
 from services.model_manager import get_model, _gpu_pool
 from services.audio_dsp import apply_mastering, normalize_audio, apply_effects_chain, get_effect_chain
-from services.audio_io import atomic_save_wav, _safe_torchaudio_save
+from services.audio_io import (
+    atomic_save_wav,
+    _safe_torchaudio_save,
+    silence_tensor,
+    coerce_non_empty_audio,
+    resolve_timeline_duration,
+)
 from services.ffmpeg_utils import (
     find_ffmpeg,
     spawn_subprocess,
@@ -149,7 +155,7 @@ async def dub_generate(job_id: str, req: DubRequest):
             seg_duration = seg.end - seg.start
             if seg_duration <= 0.05 or not seg.text.strip():
                 sr = _model.sampling_rate
-                silence = torch.zeros(1, int(seg_duration * sr))
+                silence = silence_tensor(max(seg_duration, 0.05), sr)
                 all_segment_wavs.append((seg.start, seg.end, silence, sr))
                 sync_scores.append(1.0)
                 continue
@@ -190,7 +196,7 @@ async def dub_generate(job_id: str, req: DubRequest):
                         # is broken — cleaner than aborting the whole mix.
                         yield f"data: {json.dumps({'type': 'warning', 'segment': i, 'message': f'cached seg lost, padding silence: {str(e)[:120]}'})}\n\n"
                 sr = _model.sampling_rate
-                silence = torch.zeros(1, int(seg_duration * sr))
+                silence = silence_tensor(max(seg_duration, 0.05), sr)
                 all_segment_wavs.append((seg.start, seg.end, silence, sr))
                 sync_scores.append(1.0)
                 continue
@@ -423,6 +429,14 @@ async def dub_generate(job_id: str, req: DubRequest):
                 )
                 _t_tts += time.perf_counter() - _t_tts_0
 
+                if audio_tensor.numel() == 0:
+                    logger.warning(
+                        "TTS returned empty audio for segment %s (text=%r); using silence placeholder",
+                        seg_id, (seg.text or "")[:80],
+                    )
+                    yield f"data: {json.dumps({'type': 'warning', 'segment': i, 'message': 'TTS trả về audio rỗng — chèn khoảng lặng cho phân đoạn này.'})}\n\n"
+                    audio_tensor = silence_tensor(max(seg_duration, 0.05), _model.sampling_rate)
+
                 # Check abort immediately after GPU work completes
                 if task_manager.is_cancelled(task_id):
                     yield f"data: {json.dumps({'type': 'cancelled', 'segments_processed': i + 1})}\n\n"
@@ -493,7 +507,11 @@ async def dub_generate(job_id: str, req: DubRequest):
             except Exception as e:
                 yield f"data: {json.dumps({'type': 'error', 'segment': i, 'error': str(e)})}\n\n"
                 sr = _model.sampling_rate
-                all_segment_wavs.append((seg.start, seg.end, torch.zeros(1, int(seg_duration * sr)), sr))
+                all_segment_wavs.append((
+                    seg.start, seg.end,
+                    silence_tensor(max(seg_duration, 0.05), sr),
+                    sr,
+                ))
                 sync_scores.append(1.0)
 
         _t_loop_end = time.perf_counter()
@@ -510,6 +528,12 @@ async def dub_generate(job_id: str, req: DubRequest):
         for (_si, _wav, _sr, _sid, _fp, _nstep) in _pending_seg_writes:
             seg_wav_path = dub_seg_path(job_id, _sid)
             try:
+                _seg_ref = req.segments[_si] if _si < len(req.segments) else None
+                _slot_s = (
+                    float(_seg_ref.end - _seg_ref.start)
+                    if _seg_ref is not None else 0.05
+                )
+                _wav = coerce_non_empty_audio(_wav, _sr, duration_s=max(_slot_s, 0.05))
                 # Apply invisible watermark before writing to disk
                 _wav = embed_watermark(_wav, _sr)
                 atomic_save_wav(seg_wav_path, _wav, _sr)
@@ -538,7 +562,10 @@ async def dub_generate(job_id: str, req: DubRequest):
         new_layout: list[tuple[float, float]] = []
         video_stretch_plan: list[dict] = []
         fit_plan = None  # smart_fit only — services.fit_planner.FitPlan
-        orig_total_dur = float(job.get("duration") or 0.0)
+        orig_total_dur = resolve_timeline_duration(
+            job.get("duration") or 0.0,
+            [float(seg.end) for seg in req.segments],
+        )
 
         if strategy == "stretch_video":
             cursor = 0.0
@@ -608,6 +635,7 @@ async def dub_generate(job_id: str, req: DubRequest):
         # not from the plan — so subtitles land exactly on the audio.
         fitted_cues: list[dict] = []
 
+        total_samples = max(total_samples, 1)
         full_audio = torch.zeros(1, total_samples)
 
         for i, (start, end, wav, _) in enumerate(all_segment_wavs):
@@ -943,10 +971,15 @@ async def preview_segment(job_id: str, req: SegmentPreviewRequest):
         )
         return normalize_audio(mastered, target_dBFS=-2.0)
 
+    if not (req.text or "").strip():
+        raise HTTPException(status_code=400, detail="Phân đoạn không có nội dung — không thể tạo preview.")
+
     loop = asyncio.get_running_loop()
     audio_tensor = await loop.run_in_executor(_gpu_pool, _gen)
 
     sr = getattr(_model, "sampling_rate", 24000)
+    slot_s = float(req.duration) if req.duration is not None else 0.05
+    audio_tensor = coerce_non_empty_audio(audio_tensor, sr, duration_s=max(slot_s, 0.05))
     buf = io.BytesIO()
     _safe_torchaudio_save(buf, audio_tensor, sr, format="wav")
     buf.seek(0)

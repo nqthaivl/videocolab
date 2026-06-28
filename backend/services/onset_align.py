@@ -27,6 +27,7 @@ Design constraints:
 from __future__ import annotations
 
 import logging
+import os
 from typing import Sequence
 
 import numpy as np
@@ -185,3 +186,190 @@ def snap_segment_starts(
         logger.info("onset-align: snapped %d/%d segment start(s) to speech onset",
                     adjusted, len(segments))
     return adjusted
+
+
+# Minimum continuous silence inside a segment to split at (seconds).
+MIN_SILENCE_SPLIT_S = 0.45
+# Segments shorter than this are never split further.
+MIN_SPLIT_SEGMENT_S = 2.0
+# Each sub-segment after a silence split must be at least this long.
+MIN_SPLIT_PART_S = 1.0
+
+
+def detect_silence_split_points(
+    audio: np.ndarray,
+    sr: int,
+    start_s: float,
+    end_s: float,
+    *,
+    min_gap_s: float = MIN_SILENCE_SPLIT_S,
+) -> list[float]:
+    """Return absolute split times at silence midpoints inside ``[start_s, end_s]``."""
+    if sr <= 0 or end_s - start_s < MIN_SPLIT_SEGMENT_S:
+        return []
+    i0 = max(0, int(start_s * sr))
+    i1 = min(len(audio), int(end_s * sr))
+    if i1 <= i0:
+        return []
+    window = audio[i0:i1]
+    if window.ndim > 1:
+        window = window.mean(axis=1)
+    frame_len = max(1, int(FRAME_S * sr))
+    rms = _frame_rms(window, frame_len)
+    if rms.size == 0:
+        return []
+    peak = float(rms.max())
+    if peak < ABS_RMS_FLOOR:
+        return []
+    silence_threshold = max(RELATIVE_THRESHOLD * peak * 0.35, ABS_RMS_FLOOR)
+    gap_frames = max(1, int(round(min_gap_s / FRAME_S)))
+    frame_s = frame_len / sr
+
+    split_points: list[float] = []
+    silent_run = 0
+    silent_start = 0
+    for i, v in enumerate(rms):
+        if v < silence_threshold:
+            if silent_run == 0:
+                silent_start = i
+            silent_run += 1
+        else:
+            if silent_run >= gap_frames:
+                mid = silent_start + silent_run // 2
+                t = start_s + mid * frame_s
+                if start_s + MIN_SPLIT_PART_S < t < end_s - MIN_SPLIT_PART_S:
+                    split_points.append(round(t, 3))
+            silent_run = 0
+    if silent_run >= gap_frames:
+        mid = silent_start + silent_run // 2
+        t = start_s + mid * frame_s
+        if start_s + MIN_SPLIT_PART_S < t < end_s - MIN_SPLIT_PART_S:
+            split_points.append(round(t, 3))
+    return split_points
+
+
+def _split_text_by_time_fraction(text: str, frac_start: float, frac_end: float) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    frac_start = max(0.0, min(1.0, frac_start))
+    frac_end = max(frac_start, min(1.0, frac_end))
+    if " " in text:
+        words = text.split()
+        n = len(words)
+        i0 = max(0, int(n * frac_start))
+        i1 = min(n, max(i0 + 1, int(n * frac_end)))
+        return " ".join(words[i0:i1]).strip()
+    n = len(text)
+    i0 = max(0, int(n * frac_start))
+    i1 = min(n, max(i0 + 1, int(n * frac_end)))
+    return text[i0:i1].strip()
+
+
+def split_segments_at_silence(
+    segments: Sequence[dict],
+    audio: np.ndarray,
+    sr: int,
+    *,
+    min_gap_s: float = MIN_SILENCE_SPLIT_S,
+) -> list[dict]:
+    """Split long ASR segments at internal silence gaps (FunASR/Whisper fallback).
+
+    When VAD returns one long utterance, energy valleys in the vocals track
+    still mark natural pauses between phrases.
+    """
+    if sr <= 0 or audio is None or len(audio) == 0:
+        return list(segments)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+
+    out: list[dict] = []
+    split_count = 0
+    for seg in segments:
+        try:
+            start = float(seg.get("start", 0.0))
+            end = float(seg.get("end", 0.0))
+        except (TypeError, ValueError):
+            out.append(seg)
+            continue
+        text = (seg.get("text") or "").strip()
+        if not text or end - start < MIN_SPLIT_SEGMENT_S:
+            out.append(seg)
+            continue
+        points = detect_silence_split_points(audio, sr, start, end, min_gap_s=min_gap_s)
+        if not points:
+            out.append(seg)
+            continue
+        bounds = [start] + points + [end]
+        dur = end - start
+        pieces: list[dict] = []
+        for i in range(len(bounds) - 1):
+            t0, t1 = bounds[i], bounds[i + 1]
+            pieces.append({
+                "start": round(t0, 3),
+                "end": round(t1, 3),
+                "text": _split_text_by_time_fraction(
+                    text, (t0 - start) / dur, (t1 - start) / dur
+                ),
+            })
+        # Fold ultra-short splits back into a neighbor so no text is dropped.
+        merged: list[dict] = []
+        for p in pieces:
+            if not p["text"]:
+                continue
+            if merged and (p["end"] - p["start"] < MIN_SPLIT_PART_S):
+                merged[-1]["end"] = p["end"]
+                merged[-1]["text"] = f"{merged[-1]['text']} {p['text']}".strip()
+            else:
+                merged.append(dict(p))
+        if len(merged) <= 1:
+            out.append(seg)
+            continue
+        for p in merged:
+            sub = dict(seg)
+            sub.update(p)
+            out.append(sub)
+            split_count += 1
+    if split_count:
+        logger.info("silence-split: produced %d sub-segment(s) from %d segment(s)",
+                    split_count, len(segments))
+    return out or list(segments)
+
+
+def needs_silence_resplit(segments: Sequence[dict]) -> bool:
+    """Return True when post-ASR silence splitting is worth the extra pass.
+
+    FunASR / WhisperX with good VAD already emit short segments ΓÇö re-scanning
+    the waveform for every segment is redundant and slows the transcribe stream
+    (especially when there are dozens of segments).  Modes via
+    ``OMNIVOICE_SILENCE_SPLIT``:
+
+    * ``auto`` (default) ΓÇö split only when ASR left long monolithic blocks
+    * ``1`` / ``true`` ΓÇö always run (legacy behaviour)
+    * ``0`` / ``false`` ΓÇö never run
+    """
+    mode = os.environ.get("OMNIVOICE_SILENCE_SPLIT", "auto").strip().lower()
+    if mode in ("0", "false", "no", "off"):
+        return False
+    if mode in ("1", "true", "yes", "on"):
+        return True
+    if not segments:
+        return False
+    durs: list[float] = []
+    for s in segments:
+        try:
+            d = float(s["end"]) - float(s["start"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if d > 0:
+            durs.append(d)
+    if not durs:
+        return False
+    longest = max(durs)
+    avg = sum(durs) / len(durs)
+    # ASR already gave phrase-level segments ΓÇö skip the extra RMS pass.
+    if longest < MIN_SPLIT_SEGMENT_S:
+        return False
+    if longest <= 12.0 and avg <= 8.0:
+        return False
+    return True

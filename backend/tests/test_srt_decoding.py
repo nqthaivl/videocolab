@@ -35,10 +35,30 @@ Anh mất sự cân bằng và rối trí
         assert text is not None
         result = parse_srt(text)
         assert len(result.segments) == 2
-        assert result.segments[0]["text"] == "Subviet: yugo9x"
-        assert result.segments[1]["text"] == "Anh mất sự cân bằng và rối trí"
+        assert result.segments[0]["text"] == "subviet: yugo9x"
+        assert result.segments[0]["text_original"] == "Subviet: yugo9x"
+        assert result.segments[1]["text"] == "anh mất sự cân bằng và rối trí"
+        assert result.segments[1]["text_original"] == "Anh mất sự cân bằng và rối trí"
         
     print("SRT decoding tests passed successfully!")
+
+
+def test_srt_lowercases_all_caps_cues():
+    srt_content = """1
+00:00:01,000 --> 00:00:04,000
+XIN CHÀO MỌI NGƯỜI!
+
+2
+00:00:05,000 --> 00:00:08,000
+THIS IS A TEST
+"""
+    result = parse_srt(srt_content)
+    assert len(result.segments) == 2
+    assert result.segments[0]["text"] == "xin chào mọi người!"
+    assert result.segments[0]["text_original"] == "XIN CHÀO MỌI NGƯỜI!"
+    assert result.segments[1]["text"] == "this is a test"
+    assert result.segments[1]["text_original"] == "THIS IS A TEST"
+    print("SRT lowercase normalization tests passed successfully!")
 
 if __name__ == "__main__":
     test_srt_decoding()

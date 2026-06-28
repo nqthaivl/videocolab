@@ -17,7 +17,7 @@ import os
 from dataclasses import asdict
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from api.dependencies import require_loopback
 
@@ -232,6 +232,147 @@ def set_llm_endpoint(body: _LLMEndpointBody):
     # reads env at construction) on every call, so there's no singleton to
     # invalidate — the next translate/refine picks up the new values.
     return _llm_endpoint_state()
+
+
+@router.post("/llama-server/ensure")
+async def ensure_llama_server():
+    """Start llama-server with the GGUF matching TRANSLATE_MODEL, if needed."""
+    from services.llama_server import ensure_llama_server_for_model, is_translategemma_model, status as llama_status
+
+    model_name = os.environ.get("TRANSLATE_MODEL", "").strip()
+    if not model_name:
+        raise HTTPException(
+            status_code=400,
+            detail="Chưa chọn model llama.cpp. Tải model tại Cấu hình → Model dịch.",
+        )
+    if is_translategemma_model(model_name):
+        return {
+            "ok": True,
+            "reason": "TranslateGemma dùng HuggingFace trực tiếp (không cần llama-server).",
+            **llama_status(),
+        }
+    ok, reason = await ensure_llama_server_for_model(model_name)
+    if not ok:
+        raise HTTPException(status_code=400, detail=reason)
+    return {"ok": True, "reason": reason, **llama_status()}
+
+
+@router.get("/llama-server/status")
+def get_llama_server_status():
+    from services.llama_server import status as llama_status
+
+    return llama_status()
+
+
+# ── Cloud translation APIs (OpenAI, Google Gemini, DeepSeek, 9Router) ─────────
+
+
+class _CloudProviderBody(BaseModel):
+    api_key: str | None = None  # None = unchanged; "" = clear
+    model: str | None = None
+    base_url: str | None = None  # OpenAI only
+
+
+class _TranslateCloudBody(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    openai: _CloudProviderBody | None = None
+    gemini: _CloudProviderBody | None = None
+    deepseek: _CloudProviderBody | None = None
+    nine_router: _CloudProviderBody | None = Field(None, alias="9router")
+
+
+def _persist_env_fields(mapping: dict[str, str | None]) -> None:
+    from core.prefs import set_ as prefs_set, delete as prefs_delete
+
+    for env_key, val in mapping.items():
+        if val is None:
+            continue
+        val = val.strip()
+        if val:
+            os.environ[env_key] = val
+            prefs_set(f"env.{env_key}", val)
+        else:
+            os.environ.pop(env_key, None)
+            prefs_delete(f"env.{env_key}")
+
+
+@router.get("/translate-cloud")
+def get_translate_cloud():
+    """OpenAI + Gemini translation API settings for the translate dropdown."""
+    from services.cloud_translate import translate_cloud_state
+
+    return translate_cloud_state()
+
+
+@router.put("/translate-cloud")
+def set_translate_cloud(body: _TranslateCloudBody):
+    """Persist cloud translation API keys and model names."""
+    from services.cloud_translate import translate_cloud_state
+
+    if body.openai is not None:
+        _persist_env_fields({
+            "OPENAI_TRANSLATE_API_KEY": body.openai.api_key,
+            "OPENAI_TRANSLATE_MODEL": body.openai.model,
+            "OPENAI_TRANSLATE_BASE_URL": body.openai.base_url,
+        })
+    if body.gemini is not None:
+        _persist_env_fields({
+            "GEMINI_TRANSLATE_API_KEY": body.gemini.api_key,
+            "GEMINI_TRANSLATE_MODEL": body.gemini.model,
+        })
+    if body.deepseek is not None:
+        _persist_env_fields({
+            "DEEPSEEK_TRANSLATE_API_KEY": body.deepseek.api_key,
+            "DEEPSEEK_TRANSLATE_MODEL": body.deepseek.model,
+            "DEEPSEEK_TRANSLATE_BASE_URL": body.deepseek.base_url,
+        })
+    if body.nine_router is not None:
+        _persist_env_fields({
+            "NINEROUTER_TRANSLATE_API_KEY": body.nine_router.api_key,
+            "NINEROUTER_TRANSLATE_MODEL": body.nine_router.model,
+            "NINEROUTER_TRANSLATE_BASE_URL": body.nine_router.base_url,
+        })
+    return translate_cloud_state()
+
+
+@router.get("/translate-cloud/models/openai")
+def list_openai_translate_models(
+    api_key: str | None = Query(None, description="Optional preview key before saving"),
+    base_url: str | None = Query(None, description="Optional custom OpenAI-compatible base URL"),
+):
+    from services.cloud_translate import fetch_openai_models
+
+    return fetch_openai_models(api_key=api_key, base_url=base_url)
+
+
+@router.get("/translate-cloud/models/gemini")
+def list_gemini_translate_models(
+    api_key: str | None = Query(None, description="Optional preview key before saving"),
+):
+    from services.cloud_translate import fetch_gemini_models
+
+    return fetch_gemini_models(api_key=api_key)
+
+
+@router.get("/translate-cloud/models/deepseek")
+def list_deepseek_translate_models(
+    api_key: str | None = Query(None, description="Optional preview key before saving"),
+    base_url: str | None = Query(None, description="Optional custom DeepSeek base URL"),
+):
+    from services.cloud_translate import fetch_deepseek_models
+
+    return fetch_deepseek_models(api_key=api_key, base_url=base_url)
+
+
+@router.get("/translate-cloud/models/9router")
+def list_ninerouter_translate_models(
+    api_key: str | None = Query(None, description="Optional preview key before saving"),
+    base_url: str | None = Query(None, description="Optional custom 9Router base URL"),
+):
+    from services.cloud_translate import fetch_ninerouter_models
+
+    return fetch_ninerouter_models(api_key=api_key, base_url=base_url)
 
 
 # ── License acceptance (Phase 3 Plan 03-01 / TTS-05) ──────────────────────

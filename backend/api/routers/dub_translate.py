@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import asyncio
 import logging
@@ -128,6 +129,38 @@ LANG_REQUIRED_SCRIPT = {
     "uk":  ("CYRILLIC",   (0x0400, 0x04FF)),
 }
 
+# Latin-script targets where English drift is common on LLM backends.
+_VIET_DIACRITICS = re.compile(
+    r"[├á├íß║ú├úß║í─âß║▒ß║»ß║│ß║╡ß║╖├óß║ºß║Ñß║⌐ß║½ß║¡├¿├⌐ß║╗ß║╜ß║╣├¬ß╗üß║┐ß╗âß╗àß╗ç├¼├¡ß╗ë─⌐ß╗ï├▓├│ß╗Å├╡ß╗ì├┤ß╗ôß╗æß╗òß╗ùß╗Ö╞íß╗¥ß╗¢ß╗ƒß╗íß╗ú├╣├║ß╗º┼⌐ß╗Ñ╞░ß╗½ß╗⌐ß╗¡ß╗»ß╗▒ß╗│├╜ß╗╖ß╗╣ß╗╡─æ"
+    r"├Ç├üß║ó├âß║á─éß║░ß║«ß║▓ß║┤ß║╢├éß║ªß║ñß║¿ß║¬ß║¼├ê├ëß║║ß║╝ß║╕├èß╗Çß║╛ß╗éß╗äß╗å├î├ìß╗ê─¿ß╗è├Æ├ôß╗Ä├òß╗î├öß╗Æß╗Éß╗öß╗ûß╗ÿ╞áß╗£ß╗Üß╗₧ß╗áß╗ó├Ö├Üß╗ª┼¿ß╗ñ╞»ß╗¬ß╗¿ß╗¼ß╗«ß╗░ß╗▓├¥ß╗╢ß╗╕ß╗┤─É]"
+)
+_ENGLISH_DRIFT = re.compile(
+    r"\b(the|and|you|your|we|will|this|that|with|for|from|not|are|is|it|be|on|at|"
+    r"into|first|like|won|t|ll|can|do|me|my|our|they|them|their|have|has|was|were)\b",
+    re.I,
+)
+
+
+def _looks_like_vietnamese(text: str) -> bool:
+    """Reject obvious English when the target is Vietnamese."""
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return True
+    if _VIET_DIACRITICS.search(text):
+        return True
+    if _ENGLISH_DRIFT.search(text):
+        return False
+    # Long ASCII-only output without Vietnamese diacritics is suspicious.
+    ascii_letters = sum(1 for c in letters if ord(c) < 128)
+    if ascii_letters == len(letters) and len(letters) >= 18:
+        return False
+    return True
+
+
+_LATIN_TARGET_VALIDATORS = {
+    "vi": _looks_like_vietnamese,
+}
+
 
 def _script_ratio(text: str, code: str) -> float:
     """Fraction of letters in `text` that fall inside the script block we
@@ -148,9 +181,53 @@ def _looks_like_target(text: str, code: str, threshold: float = 0.5) -> bool:
     """Sanity gate for non-Latin targets. True if `text` is *plausibly* in
     the target language by script. Only meaningful for languages with a
     distinctive script (Indic, CJK, Arabic, etc.); Latin-script targets
-    always return True since we can't distinguish English from German by
-    codepoints alone."""
+    use language-specific heuristics where available."""
+    validator = _LATIN_TARGET_VALIDATORS.get(code)
+    if validator:
+        return validator(text)
     return _script_ratio(text, code) >= threshold
+
+
+def _iso639_for_translategemma(code: str) -> str:
+    """Map app language codes to TranslateGemma ISO 639-1 codes."""
+    normalized = (code or "en").strip().lower().replace("_", "-")
+    if normalized.startswith("zh") or normalized in ("cmn-hans", "cmn"):
+        return "zh"
+    return normalized.split("-")[0]
+
+
+def _llm_chat_kwargs(
+    *,
+    provider: str,
+    model_name: str,
+    src_lang: str,
+    tgt_code: str,
+    system_msg: str,
+    user_text: str,
+) -> dict:
+    """Build OpenAI chat completion kwargs for generic LLMs vs TranslateGemma."""
+    from services.llama_server import is_translategemma_model
+
+    if provider == "llama_cpp" and is_translategemma_model(model_name):
+        return {
+            "model": model_name,
+            "temperature": 0.0,
+            "messages": [{"role": "user", "content": user_text}],
+            "extra_body": {
+                "chat_template_kwargs": {
+                    "source_lang_code": _iso639_for_translategemma(src_lang),
+                    "target_lang_code": _iso639_for_translategemma(tgt_code),
+                }
+            },
+        }
+    return {
+        "model": model_name,
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_text},
+        ],
+    }
 
 _nllb_model = None
 _nllb_tokenizer = None
@@ -184,6 +261,8 @@ def _guess_lang_from_text(segments) -> str | None:
     fails every segment even though ASR detected the language correctly.
     """
     text = " ".join((getattr(s, "text", "") or "") for s in (segments or [])[:8])
+    if _VIET_DIACRITICS.search(text):
+        return "vi"
     has = lambda lo, hi: any(lo <= ord(c) <= hi for c in text)
     if has(0x3040, 0x30FF):
         return "ja"  # Hiragana/Katakana — check before CJK (Japanese uses Kanji too)
@@ -200,13 +279,19 @@ def _guess_lang_from_text(segments) -> str | None:
 
 def _resolve_source_lang(req: TranslateRequest) -> str:
     """Pick source language: explicit request > job.source_lang > text guess > 'en'."""
+    lang: str | None = None
     if getattr(req, "source_lang", None):
-        return req.source_lang
-    if getattr(req, "job_id", None):
+        lang = req.source_lang
+    elif getattr(req, "job_id", None):
         job = _get_job(req.job_id)
         if job and job.get("source_lang"):
-            return job["source_lang"]
-    return _guess_lang_from_text(getattr(req, "segments", None)) or "en"
+            lang = job["source_lang"]
+    guessed = _guess_lang_from_text(getattr(req, "segments", None))
+    # ASR often defaults to "en" when language metadata is missing (FunASR/SenseVoice).
+    # Trust script detection over a generic English fallback.
+    if guessed and guessed != "en" and (not lang or lang in ("en", "auto")):
+        return guessed
+    return lang or guessed or "en"
 
 
 def _unload_nllb():
@@ -266,6 +351,16 @@ async def dub_translate(req: TranslateRequest):
         api_key = os.environ.get("TRANSLATE_API_KEY", "")
         loop = asyncio.get_running_loop()
         src_lang = _resolve_source_lang(req)
+        tgt_norm = (req.target_lang or "en").split("_")[0][:2].lower()
+        src_norm = (src_lang or "en").split("_")[0][:2].lower()
+        if src_norm == tgt_norm:
+            passthrough = [{"id": seg.id, "text": seg.text} for seg in req.segments]
+            return {
+                "translated": passthrough,
+                "target_lang": req.target_lang,
+                "source_lang": src_lang,
+                **_dialect_flags(req, applied=False),
+            }
 
         # Offline NLLB Transformer Translation
         if provider == "nllb":
@@ -465,15 +560,60 @@ async def dub_translate(req: TranslateRequest):
             return {"translated": translated, "target_lang": req.target_lang, "source_lang": src_lang,
                     **_dialect_flags(req, applied=False)}
 
-        if provider in ("openai", "llama_cpp"):
-            if provider == "llama_cpp":
+        if provider in ("openai", "gemini", "deepseek", "9router", "llama_cpp"):
+            if provider in ("openai", "gemini", "deepseek", "9router"):
+                from services.cloud_translate import resolve_cloud_translate
+
+                resolved = resolve_cloud_translate(provider)
+                if not resolved:
+                    labels = {
+                        "openai": "OpenAI",
+                        "gemini": "Google Gemini",
+                        "deepseek": "DeepSeek",
+                        "9router": "9Router",
+                    }
+                    label = labels.get(provider, provider)
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "error": (
+                                f"Chưa cấu hình API {label}. "
+                                "Vào Cấu hình → API dịch cloud để nhập khóa API."
+                            )
+                        },
+                    )
+                base_url, model_name, llm_key = resolved
+            elif provider == "llama_cpp":
+                model_name = os.environ.get("TRANSLATE_MODEL") or "gpt-3.5-turbo"
+                from services.llama_server import is_translategemma_model
+
+                if is_translategemma_model(model_name):
+                    from services.translategemma_translate import translate_segments
+
+                    def _translate_translategemma():
+                        return translate_segments(
+                            model_name, req.segments, src_lang, req.target_lang
+                        )
+
+                    translated = await loop.run_in_executor(_gpu_pool, _translate_translategemma)
+                    return {
+                        "translated": translated,
+                        "target_lang": req.target_lang,
+                        "source_lang": src_lang,
+                        **_dialect_flags(req, applied=False),
+                    }
+
                 base_url = os.environ.get("TRANSLATE_BASE_URL") or "http://127.0.0.1:8080/v1"
                 model_name = os.environ.get("TRANSLATE_MODEL") or "gpt-3.5-turbo"
                 llm_key = api_key or "local"
-            else:
-                base_url = os.environ.get("TRANSLATE_BASE_URL")
-                model_name = os.environ.get("TRANSLATE_MODEL", "gpt-3.5-turbo")
-                llm_key = api_key or "local"
+                from services.llama_server import ensure_llama_server_for_model
+
+                ok, reason = await ensure_llama_server_for_model(model_name)
+                if not ok:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"error": reason},
+                    )
             if not base_url:
                 return JSONResponse(
                     status_code=400,
@@ -486,6 +626,10 @@ async def dub_translate(req: TranslateRequest):
                 )
             from openai import OpenAI
             client = OpenAI(base_url=base_url, api_key=llm_key)
+            use_translategemma = provider == "llama_cpp"
+            if use_translategemma:
+                from services.llama_server import is_translategemma_model
+                use_translategemma = is_translategemma_model(model_name)
 
             def _build_prompt(src_code: str, tgt_code: str) -> str:
                 """Build a system prompt that resists hallucinations on small
@@ -517,10 +661,16 @@ async def dub_translate(req: TranslateRequest):
                 dia_clause = ""
                 if req.dialect and str(req.dialect).lower().startswith(str(tgt_code).lower()[:2]):
                     dia_clause = dialect_clause(req.dialect)
+                target_only = ""
+                if tgt_code == "vi":
+                    target_only = (
+                        " Output MUST be Vietnamese only ΓÇö never English, "
+                        "never mixed language."
+                    )
                 return (
                     f"You are a professional dubbing translator. "
                     f"Translate the user's text from {src_name} into "
-                    f"{tgt_name}.{script_clause}{dia_clause} "
+                    f"{tgt_name}.{script_clause}{dia_clause}{target_only} "
                     f"Reply ONLY with the translated {tgt_name} text, do not "
                     f"add quotes, notes, headers, explanations, or commentary."
                 )
@@ -536,7 +686,7 @@ async def dub_translate(req: TranslateRequest):
                 # output), retry once with a more emphatic instruction.
                 for attempt in range(2):
                     sys_for_attempt = system_msg
-                    if attempt == 1:
+                    if attempt == 1 and not use_translategemma:
                         sys_for_attempt = (
                             system_msg
                             + " Your previous attempt produced output in the "
@@ -544,14 +694,15 @@ async def dub_translate(req: TranslateRequest):
                             f"{LANG_NAMES.get(tgt_code, tgt_code)} translation."
                         )
                     try:
-                        res = client.chat.completions.create(
-                            model=model_name,
-                            temperature=0.2,  # less drift than default 1.0
-                            messages=[
-                                {"role": "system", "content": sys_for_attempt},
-                                {"role": "user", "content": seg.text},
-                            ],
+                        chat_kwargs = _llm_chat_kwargs(
+                            provider=provider,
+                            model_name=model_name,
+                            src_lang=src_lang,
+                            tgt_code=tgt_code,
+                            system_msg=sys_for_attempt,
+                            user_text=seg.text,
                         )
+                        res = client.chat.completions.create(**chat_kwargs)
                         out_text = (res.choices[0].message.content or "").strip()
                         if not out_text:
                             last_err = "empty LLM response"
@@ -707,7 +858,14 @@ async def dub_translate(req: TranslateRequest):
             logger.error("translate %s -> %s gave up (provider=%s): %s", src_arg, seg_lc, provider, last_err)
             return {"id": seg.id, "text": seg.text, "error": last_err or "unknown"}
 
-        tasks = [loop.run_in_executor(_cpu_pool, _translate_single, seg) for seg in req.segments]
+        max_concurrent = max(1, int(os.environ.get("TRANSLATE_MAX_CONCURRENT", "8")))
+        sem = asyncio.Semaphore(max_concurrent)
+
+        async def _translate_one(seg):
+            async with sem:
+                return await loop.run_in_executor(_cpu_pool, _translate_single, seg)
+
+        tasks = [_translate_one(seg) for seg in req.segments]
         translated = await asyncio.gather(*tasks)
         translated.sort(key=lambda x: str(x["id"]))
 

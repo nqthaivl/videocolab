@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from core.config import DUB_DIR, dub_seg_path
 from core.tasks import task_manager
 from api.routers.dub_core import _get_job
-from services.ffmpeg_utils import find_ffmpeg, run_ffmpeg
+from services.ffmpeg_utils import find_ffmpeg, probe_video_dimensions, run_ffmpeg
 from services.video_retime import (
     DRIFT_TOLERANCE_S,
     RetimeError,
@@ -24,6 +24,19 @@ from services.video_retime import (
 
 router = APIRouter()
 logger = logging.getLogger("omnivoice.api")
+
+
+def _resolve_bg_audio(job: dict, preserve_bg: bool) -> "str | None":
+    """Background bed for dub mix. Prefer Demucs ``no_vocals``; when prep skipped
+    Demucs (Clone phim + SRT) fall back to the extracted source audio so the
+    export can still blend original ambience with the dubbed track."""
+    if not preserve_bg:
+        return None
+    for key in ("no_vocals_path", "audio_path"):
+        path = job.get(key)
+        if path and os.path.exists(path):
+            return path
+    return None
 
 
 def _unique_stamp() -> str:
@@ -318,38 +331,64 @@ def _hex_to_ass_color(value: str, alpha: str = "00") -> str:
 
 
 def _write_burn_ass(job: dict, exports_dir: str, stamp: str, dual: bool, sub_x: float, sub_y: float, sub_w: float,
-                    font_size: int = 420, sub_color: str = "#ffffff", sub_bg_color: str = "#000000",
-                    fitted_segments: "list[dict] | None" = None) -> str | None:
+                    font_size: int = 42, sub_color: str = "#ffffff", sub_bg_color: str = "#000000",
+                    fitted_segments: "list[dict] | None" = None,
+                    video_w: int = 1920, video_h: int = 1080,
+                    sub_h: float = 0.12) -> str | None:
     segments = job.get("segments", [])
     if not segments:
         return None
     if fitted_segments:
         segments = _apply_fitted_times(segments, fitted_segments)
-    play_w = 10000
-    play_h = 10000
-    pos_x = int(_clamp_float(sub_x, 0.0, 1.0) * play_w)
-    pos_y = int(_clamp_float(sub_y, 0.0, 1.0) * play_h)
 
-    # Compute left/right margins to wrap text to the custom box width
-    half_w = _clamp_float(sub_w, 0.05, 1.0) / 2.0
-    left_ratio = _clamp_float(sub_x - half_w, 0.0, 0.95)
-    right_ratio = _clamp_float(1.0 - (sub_x + half_w), 0.0, 0.95)
-    margin_l = int(left_ratio * play_w)
-    margin_r = int(right_ratio * play_w)
+    play_w = max(int(video_w or 1920), 320)
+    play_h = max(int(video_h or 1080), 240)
+    center_x = _clamp_float(sub_x, 0.0, 1.0)
+    bottom_y = _clamp_float(sub_y, 0.0, 1.0)
+    box_w = _clamp_float(sub_w, 0.05, 1.0)
+    box_h = _clamp_float(sub_h, 0.03, 0.45)
 
-    ass_font_size = int(_clamp_float(font_size, 180, 900))
+    box_left = int(_clamp_float(center_x - box_w / 2.0, 0.0, 0.98) * play_w)
+    box_right = int(_clamp_float(center_x + box_w / 2.0, box_w * 0.05, 1.0) * play_w)
+    box_bottom = int(_clamp_float(bottom_y, box_h, 1.0) * play_h)
+    box_top = max(0, int(box_bottom - box_h * play_h))
+    pos_x = (box_left + box_right) // 2
+    pos_y = (box_top + box_bottom) // 2
+
+    margin_l = box_left
+    margin_r = max(0, play_w - box_right)
+    margin_v = max(0, play_h - box_bottom)
+
+    # libass Arial renders slightly smaller than browser CSS at the same numeric size.
+    ass_font_size = max(14, int(round(font_size * 1.22)))
     primary = _hex_to_ass_color(sub_color, "00")
-    back = _hex_to_ass_color(sub_bg_color, "66")
+    back = _hex_to_ass_color(sub_bg_color, "00")
     lines = [
-        "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {play_w}", f"PlayResY: {play_h}", "ScaledBorderAndShadow: yes", "",
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        f"PlayResX: {play_w}",
+        f"PlayResY: {play_h}",
+        "ScaledBorderAndShadow: yes",
+        "WrapStyle: 2",
+        "",
         "[V4+ Styles]",
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        f"Style: Default,Arial,{ass_font_size},{primary},&H000000FF,&HAA000000,{back},-1,0,0,0,100,100,0,0,3,18,4,2,{margin_l},{margin_r},80,1",
-        "", "[Events]", "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+        f"Style: Default,Arial,{ass_font_size},{primary},&H000000FF,&H00000000,{back},-1,0,0,0,100,100,0,0,3,1,0,5,{margin_l},{margin_r},{margin_v},1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
+    clip_tag = f"\\clip({box_left},{box_top},{box_right},{box_bottom})"
+    pos_tag = f"\\pos({pos_x},{pos_y})"
+    style_tag = (
+        f"{{\\an5{pos_tag}\\fs{ass_font_size}\\b1\\q2{clip_tag}"
+        f"\\1c{primary}\\4c{back}}}"
+    )
     for seg in segments:
         text = _ass_escape(_pick_subtitle_text(seg, dual))
-        lines.append(f"Dialogue: 0,{_format_ass_time(seg['start'])},{_format_ass_time(seg['end'])},Default,,0,0,0,,{{\\pos({pos_x},{pos_y})}}{text}")
+        lines.append(
+            f"Dialogue: 0,{_format_ass_time(seg['start'])},{_format_ass_time(seg['end'])},Default,,0,0,0,,{style_tag}{text}"
+        )
     sub_path = os.path.join(exports_dir, f"burn_subs_{stamp}.ass")
     with open(sub_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
@@ -525,7 +564,8 @@ async def dub_download(
     sub_x: float = Query(0.5, ge=0.0, le=1.0),
     sub_y: float = Query(0.86, ge=0.0, le=1.0),
     sub_w: float = Query(0.76, ge=0.05, le=1.0),
-    sub_font_size: int = Query(420, ge=180, le=900),
+    sub_h: float = Query(0.12, ge=0.03, le=0.45),
+    sub_font_size: int = Query(42, ge=14, le=200),
     sub_color: str = Query("#ffffff"),
     sub_bg_color: str = Query("#000000"),
     blur_subs: bool = Query(False),
@@ -538,6 +578,7 @@ async def dub_download(
     logo_x: float = Query(0.78, ge=0.0, le=1.0),
     logo_y: float = Query(0.08, ge=0.0, le=1.0),
     logo_w: float = Query(0.16, ge=0.03, le=0.6),
+    logo_h: float = Query(0.09, ge=0.03, le=0.6),
     out_format: str = Query("m4a", description="Audio-only jobs (#119): output container - wav, m4a, mp3, or flac. Ignored for video jobs."),
 ):
     # Strict allowlist on the path param BEFORE it reaches any filesystem
@@ -591,8 +632,7 @@ async def dub_download(
         # safe_name below).
         safe_lang = "".join(c for c in lang_code if c.isalnum() or c in "-_") or "track"
         out_path = os.path.join(exports_dir, f"dubbed_audio_{safe_lang}_{stamp}.{fmt}")
-        bg = job.get("no_vocals_path") if preserve_bg else None
-        bg = bg if (bg and os.path.exists(bg)) else None
+        bg = _resolve_bg_audio(job, preserve_bg)
         cmd = _build_audio_export_cmd(ffmpeg, track_info["path"], bg, out_path, fmt)
         try:
             rc, _, stderr = await run_ffmpeg(cmd, timeout=1800.0)
@@ -651,7 +691,12 @@ async def dub_download(
     # Smart Fit: cue times come from the fitted timeline — that's where the
     # dubbed audio actually sits, whether or not the video retime succeeds.
     fitted_segments = _fitted_segments_for(job, default_track) if default_track and default_track != "original" else None
-    sub_path = _write_burn_ass(job, exports_dir, stamp, dual, sub_x, sub_y, sub_w, sub_font_size, sub_color, sub_bg_color, fitted_segments=fitted_segments) if burn_subs else None
+    video_dims = await probe_video_dimensions(video_path)
+    video_w, video_h = video_dims if video_dims else (1920, 1080)
+    sub_path = _write_burn_ass(
+        job, exports_dir, stamp, dual, sub_x, sub_y, sub_w, sub_font_size, sub_color, sub_bg_color,
+        fitted_segments=fitted_segments, video_w=video_w, video_h=video_h, sub_h=sub_h,
+    ) if burn_subs else None
 
     # ── Smart Fit video retime (two-tier) ─────────────────────────────────
     # Tier 1 (≤48 chunks): single filter_complex graph inlined into the mux
@@ -720,7 +765,7 @@ async def dub_download(
         logo_idx = input_idx
         input_idx += 1
 
-    bg_audio = job.get("no_vocals_path") if preserve_bg else None
+    bg_audio = _resolve_bg_audio(job, preserve_bg)
     bg_idx = None
     if bg_audio and os.path.exists(bg_audio) and filtered_tracks:
         cmd += ["-i", bg_audio]
@@ -765,7 +810,7 @@ async def dub_download(
                 regions = []
         if not regions:
             regions = [{"x": blur_x, "y": blur_y, "w": blur_w, "h": blur_h}]
-        for idx, region in enumerate(regions[:12]):
+        for idx, region in enumerate(regions[:48]):
             bx = _clamp_float(region.get("x", blur_x), 0.0, 0.98)
             by = _clamp_float(region.get("y", blur_y), 0.0, 0.98)
             bw = min(_clamp_float(region.get("w", blur_w), 0.02, 1.0), 1.0 - bx)
@@ -775,10 +820,15 @@ async def dub_download(
             crop_label = f"vblurcrop{idx}"
             blurred_label = f"vblurred{idx}"
             out_label = f"vblur{idx}"
+            enable_expr = ""
+            if region.get("start") is not None and region.get("end") is not None:
+                t0 = _clamp_float(region["start"], 0.0, 86400.0)
+                t1 = max(t0, _clamp_float(region["end"], 0.0, 86400.0))
+                enable_expr = f":enable='between(t,{t0:.3f},{t1:.3f})'"
             filter_parts.append(
                 f"{blur_src}split=2[{base_label}][{crop_label}];"
                 f"[{crop_label}]crop=iw*{bw:.6f}:ih*{bh:.6f}:iw*{bx:.6f}:ih*{by:.6f},boxblur=18:1[{blurred_label}];"
-                f"[{base_label}][{blurred_label}]overlay=main_w*{bx:.6f}:main_h*{by:.6f}[{out_label}]"
+                f"[{base_label}][{blurred_label}]overlay=main_w*{bx:.6f}:main_h*{by:.6f}{enable_expr}[{out_label}]"
             )
             video_map = f"[{out_label}]"
             video_reencode = True
@@ -793,7 +843,9 @@ async def dub_download(
             sub_src = f"[{retimed_idx}:v]"
         else:
             sub_src = "[0:v]"
-        filter_parts.append(f"{sub_src}subtitles='{esc}'[vsub]")
+        filter_parts.append(
+            f"{sub_src}subtitles='{esc}':original_size={video_w}x{video_h}[vsub]"
+        )
         video_map = "[vsub]"
     if stretch_entry:
         orig_dur = float(stretch_entry.get("orig_duration") or job.get("duration") or 0.0)
@@ -809,8 +861,13 @@ async def dub_download(
         lx = _clamp_float(logo_x, 0.0, 0.98)
         ly = _clamp_float(logo_y, 0.0, 0.98)
         lw = _clamp_float(logo_w, 0.03, 0.6)
+        lh = _clamp_float(logo_h, 0.03, 0.6)
         logo_src = _video_filter_label(video_map)
-        filter_parts.append(f"[{logo_idx}:v]{logo_src}scale2ref=w=main_w*{lw:.6f}:h=-1[ovlogo][vlogoref];[vlogoref][ovlogo]overlay=main_w*{lx:.6f}:main_h*{ly:.6f}[vlogo]")
+        filter_parts.append(
+            f"[{logo_idx}:v]{logo_src}scale2ref="
+            f"w=main_w*{lw:.6f}:h=main_h*{lh:.6f}:force_original_aspect_ratio=decrease"
+            f"[ovlogo][vlogoref];[vlogoref][ovlogo]overlay=main_w*{lx:.6f}:main_h*{ly:.6f}[vlogo]"
+        )
         video_map = "[vlogo]"
         video_reencode = True
 
@@ -1030,7 +1087,7 @@ async def dub_preview_video(
     if not video_path or not os.path.exists(video_path):
         raise HTTPException(status_code=404, detail="Source video missing")
 
-    bg_audio = job.get("no_vocals_path") if preserve_bg else None
+    bg_audio = _resolve_bg_audio(job, preserve_bg)
     has_bg = bool(bg_audio and os.path.exists(bg_audio))
 
     if not _SAFE_LANG.match(lang):
@@ -1470,7 +1527,7 @@ async def dub_download_audio(job_id: str, lang: str = Query(None), preserve_bg: 
     exports_dir = os.path.join(DUB_DIR, job_id, "exports")
     os.makedirs(exports_dir, exist_ok=True)
 
-    bg_audio = job.get("no_vocals_path") if preserve_bg else None
+    bg_audio = _resolve_bg_audio(job, preserve_bg)
     if bg_audio and os.path.exists(bg_audio):
         ffmpeg = find_ffmpeg()
         final_audio_path = os.path.join(exports_dir, f"mixed_dub_{lang_label}_{stamp}.wav")
@@ -1710,7 +1767,7 @@ async def dub_download_mp3(job_id: str, lang: str = Query(None), preserve_bg: bo
     os.makedirs(exports_dir, exist_ok=True)
 
     source_path = wav_path
-    bg_audio = job.get("no_vocals_path") if preserve_bg else None
+    bg_audio = _resolve_bg_audio(job, preserve_bg)
     if bg_audio and os.path.exists(bg_audio):
         mixed_path = os.path.join(exports_dir, f"mixed_mp3_{lang_label}_{stamp}.wav")
         cmd_mix = [
@@ -1784,7 +1841,7 @@ async def dub_export_stems(job_id: str, lang: str = Query(None)):
     else:
         raise HTTPException(status_code=400, detail="No dubbed audio track")
 
-    bg_path = job.get("no_vocals_path")
+    bg_path = _resolve_bg_audio(job, True)
 
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:

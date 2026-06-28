@@ -11,6 +11,8 @@ from services.proc_registry import register_proc, unregister_proc
 
 logger = logging.getLogger("omnivoice.api")
 
+_FFMPEG_RESOLVED: str | None = None
+
 # Cap concurrent ffmpeg jobs so macOS posix_spawn can't hit EAGAIN under load.
 _FFMPEG_SEMAPHORE: "asyncio.Semaphore | None" = None
 _FFMPEG_CONCURRENCY = 2
@@ -53,6 +55,53 @@ def _binary_runs(path: str) -> bool:
     return ok
 
 
+def _bundled_bin_dir() -> str:
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "bin"))
+
+
+def _prepend_path(dir_path: str) -> None:
+    if not dir_path or not os.path.isdir(dir_path):
+        return
+    sep = os.pathsep
+    current = os.environ.get("PATH", "")
+    parts = [p for p in current.split(sep) if p]
+    if dir_path not in parts:
+        os.environ["PATH"] = dir_path + sep + current
+
+
+def _configure_pydub(ffmpeg_path: str, ffprobe_path: "str | None" = None) -> None:
+    try:
+        from pydub import AudioSegment
+        AudioSegment.converter = ffmpeg_path
+        probe = ffprobe_path
+        if not probe:
+            probe = ffmpeg_path.replace("ffmpeg.exe", "ffprobe.exe").replace("ffmpeg", "ffprobe")
+        if probe and os.path.isfile(probe):
+            AudioSegment.ffprobe = probe
+    except ImportError:
+        pass
+
+
+def bootstrap_ffmpeg_env() -> "str | None":
+    """Expose bundled ffmpeg before pydub / whisper import.
+
+    ``setup-portable.ps1`` installs ``ffmpeg.exe`` + ``ffprobe.exe`` under
+    ``backend/bin/``. Electron does not inherit a shell PATH, so prepend that
+    directory and publish ``FFMPEG_PATH`` / ``FFPROBE_PATH`` early.
+    """
+    global _FFMPEG_RESOLVED
+
+    _prepend_path(_bundled_bin_dir())
+    path = find_ffmpeg()
+    if path:
+        os.environ.setdefault("FFMPEG_PATH", path)
+        probe = resolve_ffprobe()
+        if probe:
+            os.environ.setdefault("FFPROBE_PATH", probe)
+            os.environ.setdefault("OMNIVOICE_FFPROBE_PATH", probe)
+    return path
+
+
 def find_ffmpeg():
     """Locate an ffmpeg binary.
 
@@ -63,30 +112,36 @@ def find_ffmpeg():
 
     Returns the path string, or ``None`` if nothing found.
     """
+    global _FFMPEG_RESOLVED
+    if _FFMPEG_RESOLVED:
+        return _FFMPEG_RESOLVED
+
+    def _finish(path: str | None) -> str | None:
+        global _FFMPEG_RESOLVED
+        if path:
+            _FFMPEG_RESOLVED = path
+            _configure_pydub(path, resolve_ffprobe())
+        return path
+
     # 0. Local project path (backend/bin/)
-    local_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "bin"))
+    local_dir = _bundled_bin_dir()
     binary_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
     local_path = os.path.join(local_dir, binary_name)
     if os.path.isfile(local_path) and _binary_runs(local_path):
-        try:
-            from pydub import AudioSegment
-            AudioSegment.converter = local_path
-        except ImportError:
-            pass
-        return local_path
+        return _finish(local_path)
 
     # 1. Env var injected by Tauri host
     env_path = os.environ.get("FFMPEG_PATH")
     if env_path:
-        resolved = shutil.which(env_path)
+        resolved = env_path if os.path.isfile(env_path) else shutil.which(env_path)
         if resolved and _binary_runs(resolved):
-            return resolved
+            return _finish(resolved)
     # 2. imageio-ffmpeg bundled static binary
     try:
         import imageio_ffmpeg
         candidate = imageio_ffmpeg.get_ffmpeg_exe()
         if candidate and os.path.isfile(candidate) and _binary_runs(candidate):
-            return candidate
+            return _finish(candidate)
         logger.debug("imageio_ffmpeg binary not usable at %s", candidate)
     except Exception as e:
         logger.debug("imageio_ffmpeg unavailable: %s", e)
@@ -102,7 +157,7 @@ def find_ffmpeg():
     for path in common:
         resolved = shutil.which(path)
         if resolved and _binary_runs(resolved):
-            return resolved
+            return _finish(resolved)
     logger.warning("ffmpeg not found (or not runnable) in env, imageio, or system PATH")
     return None
 
@@ -335,11 +390,7 @@ async def _pitch_preserving_stretch(wav, target_samples: int, sr: int):
 
 
 async def probe_duration(path: str) -> float | None:
-    """Return a media file's duration in seconds via ffprobe, or None.
-
-    Used by the Smart Fit pipeline to sanity-check source/track lengths
-    without loading the media. Never raises — probing is best-effort.
-    """
+    """Return a media file's duration in seconds via ffprobe, or None."""
     ffprobe = find_ffprobe()
     if not ffprobe or not os.path.isfile(path):
         return None
@@ -358,6 +409,36 @@ async def probe_duration(path: str) -> float | None:
         return float(stdout.decode().strip())
     except Exception as e:
         logger.debug("probe_duration failed for %s: %s", os.path.basename(str(path)), e)
+        return None
+
+
+async def probe_video_dimensions(path: str) -> "tuple[int, int] | None":
+    """Return (width, height) of the first video stream, or None on failure."""
+    ffprobe = find_ffprobe()
+    if not ffprobe or not os.path.isfile(path):
+        return None
+    try:
+        proc = await spawn_subprocess(
+            ffprobe, "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=p=0:s=x",
+            path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode != 0:
+            return None
+        parts = stdout.decode().strip().split("x")
+        if len(parts) != 2:
+            return None
+        w, h = int(parts[0]), int(parts[1])
+        if w <= 0 or h <= 0:
+            return None
+        return w, h
+    except Exception as e:
+        logger.debug("probe_video_dimensions failed for %s: %s", os.path.basename(str(path)), e)
         return None
 
 
